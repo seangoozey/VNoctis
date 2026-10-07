@@ -20,7 +20,8 @@ RUN addgroup -S vnm && adduser -S vnm -G vnm
 # Remove default nginx config
 RUN rm /etc/nginx/conf.d/default.conf
 
-COPY nginx.conf /etc/nginx/conf.d/default.conf
+# The runtime user must be able to read this even with restrictive host permissions.
+COPY --chmod=0644 nginx.conf /etc/nginx/conf.d/default.conf
 COPY --from=builder /app/dist /usr/share/nginx/html
 
 RUN mkdir -p /web-builds /covers && \

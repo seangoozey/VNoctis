@@ -29,6 +29,10 @@ COPY --from=builder /app/src ./src
 COPY --from=builder /app/prisma ./prisma
 COPY --from=builder /app/templates ./templates
 
+# Source files can arrive with restrictive host permissions. PUID/PGID users
+# need read access to files and traversal access to application directories.
+RUN chmod -R a+rX /app
+
 # Create directories that may be used as mount points
 RUN mkdir -p /data /data/logs /covers /web-builds /games
 
