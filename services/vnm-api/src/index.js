@@ -18,6 +18,7 @@ import coversRoutes from './routes/covers.js';
 import importRoutes from './routes/import.js';
 import internalRoutes from './routes/internal.js';
 import favoritesRoutes from './routes/favorites.js';
+import savesRoutes from './routes/saves.js';
 import usersRoutes from './routes/users.js';
 import settingsRoutes from './routes/settings.js';
 import publishRoutes from './routes/publish.js';
@@ -199,6 +200,7 @@ await fastify.register(authRoutes, { prefix: '/api/v1' });
 
 // ── Favorites routes (per-user) ───────────────────────────
 await fastify.register(favoritesRoutes, { prefix: '/api/v1' });
+await fastify.register(savesRoutes, { prefix: '/api/v1' });
 
 // ── User management routes (admin-only) ───────────────────
 await fastify.register(usersRoutes, { prefix: '/api/v1' });

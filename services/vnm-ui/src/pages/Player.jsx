@@ -3,7 +3,7 @@ import { useState, useRef, useEffect, useCallback } from 'react';
 import useBuildStatus from '../hooks/useBuildStatus';
 import PlayerChrome from '../components/PlayerChrome';
 import BuildProgress from '../components/BuildProgress';
-import SaveWarningToast from '../components/SaveWarningToast';
+import useAuth from '../hooks/useAuth';
 
 /**
  * Full in-browser game player page at `/play/:gameId`.
@@ -21,6 +21,8 @@ import SaveWarningToast from '../components/SaveWarningToast';
  */
 export default function Player() {
   const { gameId } = useParams();
+  const { user } = useAuth();
+  const [saveStatus, setSaveStatus] = useState('Starting save sync…');
   const {
     game,
     loading,
@@ -43,6 +45,16 @@ export default function Player() {
   // ---- Fullscreen ----
   const containerRef = useRef(null);
   const iframeRef = useRef(null);
+  useEffect(() => {
+    setSaveStatus('Starting save sync…');
+    const listener = event => {
+      if (event.origin === window.location.origin && event.source === iframeRef.current?.contentWindow &&
+          event.data?.type === 'vnm-save-status' && typeof event.data.message === 'string') setSaveStatus(event.data.message);
+    };
+    window.addEventListener('message', listener);
+    const timeout = setTimeout(() => setSaveStatus(value => value === 'Starting save sync…' ? 'Save sync unavailable — browser saves only' : value), 30000);
+    return () => { window.removeEventListener('message', listener); clearTimeout(timeout); };
+  }, [gameId]);
   const [isFullscreen, setIsFullscreen] = useState(false);
 
   // ---- Chrome bar visibility (ref-based dedup) ----
@@ -350,13 +362,13 @@ export default function Player() {
           <>
             <iframe
               ref={iframeRef}
-              src={`${game.webBuildPath}/index.html`}
+              src={`${game.webBuildPath}/index.html?vnmGame=${encodeURIComponent(gameId)}&vnmUser=${encodeURIComponent(user?.userId || '')}`}
               title={title}
               sandbox="allow-scripts allow-same-origin allow-popups allow-forms allow-downloads"
               allow="autoplay; fullscreen"
               className="absolute inset-0 w-full h-full border-0"
             />
-            <SaveWarningToast />
+            <div role="status" className="absolute bottom-3 left-3 z-10 bg-gray-900/90 text-white text-xs rounded px-3 py-2">{saveStatus}</div>
           </>
         ) : showIframe ? (
           /* Game is built & ready but the portrait overlay is still blocking.
