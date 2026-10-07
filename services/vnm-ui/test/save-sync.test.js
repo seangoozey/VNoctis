@@ -2,17 +2,26 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import { readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 
 const source = readFileSync(new URL('../public/save-sync.js', import.meta.url), 'utf8');
 const root = '/home/web_user/.renpy';
 const settle = async () => { for (let i = 0; i < 20; i++) await new Promise(resolve => setImmediate(resolve)); };
+const saveHash = copy => createHash('sha256').update(JSON.stringify((copy?.files || [])
+  .filter(file => file.path.endsWith('.save')).map(file => [file.path, file.data])
+  .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0))).digest('hex');
 
 // Model the IDBFS populate/flush boundary rather than Ren'Py save semantics.
 function browser(server, databases, { user = 'A', game = 'X', metadata = new Map(), choices = [] } = {}) {
+  server.receipts ||= new Map(); server.alternates ||= [];
   const files = new Map(); const dirs = new Set([root]); const statuses = [];
   const events = [];
   const backups = new Map();
   let interval, offline = false;
+  let nextUploadGate;
+  let loseResponse = false;
+  const listeners = new Map(); const documentListeners = new Map();
+  const timers = new Map(); let timerId = 0;
   const token = `header.${Buffer.from(JSON.stringify({ userId: user })).toString('base64url')}.signature`;
   metadata.set('vnm-token', token);
   const namespace = `vnm-saves:${user}:${game}`;
@@ -22,7 +31,9 @@ function browser(server, databases, { user = 'A', game = 'X', metadata = new Map
     isDir: mode => (mode & 0o170000) === 0o40000,
     isFile: mode => (mode & 0o170000) === 0o100000,
     readFile: path => files.get(path).bytes,
-    writeFile: (path, bytes) => files.set(path, { bytes: new Uint8Array(bytes), mtime: 1234 }),
+    writeFile: (path, bytes) => { files.set(path, { bytes: new Uint8Array(bytes), mtime: 1234 }); fs.close({ path, flags: 1 }); },
+    close() {},
+    rename: (from, to) => { files.set(to, files.get(from)); files.delete(from); },
     mkdirTree: path => { const parts = path.split('/'); while (parts.length) { dirs.add(parts.join('/')); parts.pop(); } },
     utime: (path, atime, mtime) => { files.get(path).mtime = mtime; },
     unlink: path => files.delete(path), rmdir: path => dirs.delete(path),
@@ -55,19 +66,32 @@ function browser(server, databases, { user = 'A', game = 'X', metadata = new Map
       };
       callback(null, db);
     } },
-    setInterval: callback => { interval = callback; return 1; }, clearInterval() {},
-    addEventListener() {},
-    document: { createElement: tag => ({ style: {}, append() {}, remove() {}, tag }), body: {
+    setInterval: callback => { interval = callback; timers.set(++timerId, callback); return timerId; },
+    clearInterval: id => timers.delete(id),
+    addEventListener: (event, callback) => listeners.set(event, callback),
+    document: { visibilityState: 'visible', addEventListener: (event, callback) => documentListeners.set(event, callback), createElement: tag => ({ style: {}, append() {}, remove() {}, tag }), body: {
       append: panel => { /* replaced below to capture actual buttons */ },
     } },
-    indexedDB: { open: () => {
+    indexedDB: { open: name => {
       const req = {};
+      if (!databases.has(name)) databases.set(name, { files: new Map() });
+      const storage = name === 'vnm-save-backups' ? backups : databases.get(name).files;
       queueMicrotask(() => {
-        req.result = { close() {}, transaction: () => {
-          const tx = { objectStore: () => ({ put: (copy, key) => {
-            backups.set(key, JSON.parse(JSON.stringify(copy)));
-            queueMicrotask(() => tx.oncomplete());
-          } }) }; return tx;
+        req.result = { close() {}, transaction: storeName => {
+          const storeKey = key => name === 'vnm-save-outbox' ? `${storeName}:${key}` : key;
+          const action = (operation, key, value) => {
+            const result = { result: undefined };
+            queueMicrotask(() => {
+              if (operation === 'put') storage.set(storeKey(key), JSON.parse(JSON.stringify(value)));
+              if (operation === 'delete') storage.delete(storeKey(key));
+              if (operation === 'get') result.result = storage.get(storeKey(key));
+              tx.oncomplete();
+            }); return result;
+          };
+          const tx = { objectStore: () => ({
+            put: (copy, key) => action('put', key, copy),
+            get: key => action('get', key), delete: key => action('delete', key),
+          }) }; return tx;
         } }; req.onsuccess();
       }); return req;
     } },
@@ -75,11 +99,29 @@ function browser(server, databases, { user = 'A', game = 'X', metadata = new Map
       if (offline) throw new Error('network down');
       const key = `${user}:${game}`;
       const state = server.get(key) || { revision: 0, snapshot: null };
-      if (options.method === 'GET') return { ok: true, status: 200, json: async () => state };
+      if (options.method === 'GET') {
+        const id = new URLSearchParams(url.split('?')[1] || '').get('uploadId');
+        return { ok: true, status: 200, json: async () => ({ ...state, saveChecksum: saveHash(state.snapshot),
+          acknowledgement: server.receipts.get(`${key}:${id}`)?.response || null }) };
+      }
       const body = JSON.parse(options.body);
-      if (state.revision !== body.revision) return { ok: false, status: 409 };
-      const next = { revision: state.revision + 1, snapshot: body.snapshot };
-      server.set(key, next); return { ok: true, status: 200, json: async () => next };
+      const receiptKey = `${key}:${body.uploadId}`, receipt = server.receipts.get(receiptKey);
+      if (receipt) {
+        if (receipt.payload !== JSON.stringify(body.snapshot)) return { ok: false, status: 409 };
+        return { ok: true, status: 200, json: async () => receipt.response };
+      }
+      const alternate = state.snapshot && (body.alternate || (state.revision !== body.revision &&
+        body.baseSaveChecksum !== saveHash(state.snapshot) && saveHash(body.snapshot) !== saveHash(state.snapshot)));
+      const next = { revision: alternate ? body.revision : state.revision + 1, snapshot: body.snapshot, uploadId: body.uploadId };
+      const branchId = alternate ? body.branchId || body.uploadId : null;
+      if (alternate) server.alternates.push({ key, branchId, snapshot: body.snapshot });
+      else server.set(key, next);
+      const response = { revision: next.revision, disposition: alternate ? 'alternate' : 'current', branchId, saveChecksum: saveHash(body.snapshot) };
+      server.receipts.set(receiptKey, { payload: JSON.stringify(body.snapshot), response });
+      if (loseResponse) { loseResponse = false; throw new Error('response lost after commit'); }
+      const gate = nextUploadGate; nextUploadGate = null;
+      if (gate) await gate;
+      return { ok: true, status: 200, json: async () => response };
     },
   };
   const buttons = [];
@@ -90,6 +132,11 @@ function browser(server, databases, { user = 'A', game = 'X', metadata = new Map
   return {
     fs, statuses, events, metadata, namespace, backups,
     offline: value => { offline = value; },
+    pauseNextUpload() { let release; nextUploadGate = new Promise(resolve => { release = resolve; }); return release; },
+    loseNextResponse() { loseResponse = true; },
+    activeTimers: () => timers.size,
+    async event(name) { listeners.get(name)?.(); await settle(); },
+    async visibility(state) { context.document.visibilityState = state; documentListeners.get('visibilitychange')?.(); await settle(); },
     async start() { context.Module.preInit.at(-1)(); await new Promise(resolve => fs.syncfs(true, resolve)); await settle(); },
     async flush() { await new Promise(resolve => fs.syncfs(false, resolve)); await settle(); },
     async save(data = 'progress') { fs.mkdirTree(`${root}/game`); fs.writeFile(`${root}/game/1.save`, Buffer.from(data)); await new Promise(resolve => fs.syncfs(false, resolve)); await settle(); await interval(); await settle(); },
@@ -127,7 +174,11 @@ test('competing sessions preserve the rejected browser copy', async () => {
   await a.save('winner'); await b.save('conflicting');
   assert.equal(server.get('A:X').revision, 2);
   assert.equal(Buffer.from(b.fs.readFile(`${root}/game/1.save`)).toString(), 'conflicting');
-  assert.ok(b.statuses.some(s => s.startsWith('Conflict detected')));
+  assert.ok(b.statuses.includes('Save backed up as alternate version'));
+  assert.equal(server.alternates.length, 1);
+  await b.save('alternate continuation');
+  assert.equal(server.alternates.length, 2);
+  assert.equal(server.alternates[0].branchId, server.alternates[1].branchId);
   await b.retry(); assert.equal(server.get('A:X').revision, 2);
 });
 
@@ -150,18 +201,16 @@ test('declining legacy import leaves original saves untouched', async () => {
   assert.equal(server.size, 0); assert.equal(databases.get(root).files.size, 1);
 });
 
-test('startup conflict keeps offline progress unless server restoration is explicitly selected', async () => {
+test('startup preserves offline progress as an alternate and loads synced saves without a prompt', async () => {
   const server = new Map(), databases = new Map(), metadata = new Map();
   const a = browser(server, databases, { metadata }); await a.start(); await a.save('initial');
   a.offline(true); await a.save('offline progress');
   const b = browser(server, new Map()); await b.start(); await b.save('server progress');
   const reload = browser(server, databases, { metadata }); await reload.start();
-  assert.equal(Buffer.from(reload.fs.readFile(`${root}/game/1.save`)).toString(), 'offline progress');
-  assert.ok(reload.statuses.includes('Conflict detected — browser saves only'));
-  const useServer = browser(server, databases, { metadata, choices: [1] }); await useServer.start();
-  assert.equal(Buffer.from(useServer.fs.readFile(`${root}/game/1.save`)).toString(), 'server progress');
-  assert.equal(useServer.backups.size, 1);
-  const copy = [...useServer.backups.values()][0];
+  assert.equal(Buffer.from(reload.fs.readFile(`${root}/game/1.save`)).toString(), 'server progress');
+  assert.ok(reload.statuses.includes('Unsynced device saves preserved in history'));
+  assert.equal(server.alternates.length, 1);
+  const copy = server.alternates[0].snapshot;
   assert.equal(Buffer.from(copy.files[0].data, 'base64').toString(), 'offline progress');
 });
 
@@ -209,4 +258,134 @@ test('each successful save-slot upload is acknowledged; offline failures are not
     await a.flush(); await a.retry();
   }
   assert.equal(a.events.filter(event => event.saveUploaded).length, 5);
+});
+
+test('direct and atomic slot writes upload after flush without waiting for the timer', async () => {
+  const server = new Map(); const a = browser(server, new Map()); await a.start();
+  a.fs.mkdirTree(`${root}/game`);
+  a.fs.writeFile(`${root}/game/1.save`, Buffer.from('first'));
+  assert.equal(server.has('A:X'), false);
+  await a.flush();
+  assert.equal(server.get('A:X').revision, 1);
+  a.fs.writeFile(`${root}/game/1.save`, Buffer.from('first')); await a.flush();
+  assert.equal(server.get('A:X').revision, 1, 'identical slot bytes are deduplicated');
+  a.fs.writeFile(`${root}/game/persistent`, Buffer.from('preferences')); await a.flush();
+  assert.equal(server.get('A:X').revision, 1, 'persistent data stays batched');
+  a.fs.writeFile(`${root}/game/tmp`, Buffer.from('quick save'));
+  a.fs.rename(`${root}/game/tmp`, `${root}/game/quick-1.save`);
+  await a.flush();
+  assert.equal(server.get('A:X').revision, 2);
+  assert.equal(a.events.filter(event => event.saveUploaded).length, 2);
+});
+
+test('a slot saved during an upload follows immediately after its acknowledgement', async () => {
+  const server = new Map(); const a = browser(server, new Map()); await a.start();
+  const release = a.pauseNextUpload();
+  a.fs.mkdirTree(`${root}/game`);
+  a.fs.writeFile(`${root}/game/auto-1.save`, Buffer.from('first')); await a.flush();
+  a.fs.writeFile(`${root}/game/auto-1.save`, Buffer.from('second')); await a.flush();
+  assert.equal(server.get('A:X').revision, 1);
+  release(); await settle();
+  assert.equal(server.get('A:X').revision, 2);
+  const slot = server.get('A:X').snapshot.files.find(file => file.path.endsWith('auto-1.save'));
+  assert.equal(Buffer.from(slot.data, 'base64').toString(), 'second');
+});
+
+test('lost acknowledgement retries the same upload before uploading newer offline progress', async () => {
+  const server = new Map(), databases = new Map(), metadata = new Map();
+  const a = browser(server, databases, { metadata }); await a.start();
+  a.loseNextResponse();
+  a.fs.mkdirTree(`${root}/game`);
+  a.fs.writeFile(`${root}/game/1.save`, Buffer.from('committed')); await a.flush();
+  assert.equal(server.get('A:X').revision, 1);
+  const firstId = server.get('A:X').uploadId;
+  a.offline(true); a.fs.writeFile(`${root}/game/1.save`, Buffer.from('offline progress')); await a.flush();
+  const reload = browser(server, databases, { metadata }); reload.offline(true); await reload.start();
+  reload.offline(false); await reload.retry();
+  assert.equal(server.get('A:X').revision, 2);
+  assert.notEqual(server.get('A:X').uploadId, firstId);
+  assert.equal(Buffer.from(server.get('A:X').snapshot.files.find(file => file.path.endsWith('.save')).data, 'base64').toString(), 'offline progress');
+  assert.ok(!reload.statuses.some(status => status.startsWith('Conflict')));
+});
+
+test('reload recognizes an already committed upload even when its response was lost', async () => {
+  const server = new Map(), databases = new Map(), metadata = new Map();
+  const a = browser(server, databases, { metadata }); await a.start();
+  a.loseNextResponse(); a.fs.mkdirTree(`${root}/game`);
+  a.fs.writeFile(`${root}/game/1.save`, Buffer.from('committed')); await a.flush();
+  const reload = browser(server, databases, { metadata }); await reload.start();
+  assert.equal(server.get('A:X').revision, 1);
+  assert.ok(!reload.statuses.some(status => status.startsWith('Conflict')));
+  assert.ok(!databases.get('vnm-save-outbox').files.has('uploads:vnm-saves:A:X'));
+});
+
+test('page and visibility restoration restart one timer and upload pending offline data', async () => {
+  const server = new Map(); const a = browser(server, new Map()); await a.start();
+  a.offline(true); a.fs.mkdirTree(`${root}/game`);
+  a.fs.writeFile(`${root}/game/persistent`, Buffer.from('preferences')); await a.flush();
+  await a.event('pagehide'); assert.equal(a.activeTimers(), 0);
+  a.offline(false); await a.event('pageshow');
+  assert.equal(a.activeTimers(), 1); assert.equal(server.get('A:X').revision, 1);
+  await a.event('pageshow'); await a.visibility('visible');
+  assert.equal(a.activeTimers(), 1);
+  assert.equal(server.get('A:X').revision, 1);
+});
+
+test('desktop-to-mobile handoff silently replaces stale slots despite dirty persistent data', async () => {
+  const server = new Map(), mobileDatabases = new Map(), mobileMetadata = new Map();
+  const desktop = browser(server, new Map()); await desktop.start(); await desktop.save('first');
+  const mobile = browser(server, mobileDatabases, { metadata: mobileMetadata }); await mobile.start();
+  mobile.offline(true);
+  mobile.fs.writeFile(`${root}/game/persistent`, Buffer.from('local seen text')); await mobile.flush();
+  await desktop.save('new desktop progress');
+  const reload = browser(server, mobileDatabases, { metadata: mobileMetadata }); await reload.start();
+  assert.equal(Buffer.from(reload.fs.readFile(`${root}/game/1.save`)).toString(), 'new desktop progress');
+  assert.equal(server.get('A:X').revision, 2);
+  assert.ok(!reload.statuses.some(status => status.startsWith('Conflict')));
+});
+
+test('actual offline slot progress on both devices is archived before loading the server continuation', async () => {
+  const server = new Map(), mobileDatabases = new Map(), mobileMetadata = new Map();
+  const desktop = browser(server, new Map()); await desktop.start(); await desktop.save('first');
+  const mobile = browser(server, mobileDatabases, { metadata: mobileMetadata }); await mobile.start();
+  mobile.offline(true); await mobile.save('offline mobile progress');
+  await desktop.save('desktop progress');
+  const reload = browser(server, mobileDatabases, { metadata: mobileMetadata }); await reload.start();
+  assert.equal(Buffer.from(reload.fs.readFile(`${root}/game/1.save`)).toString(), 'desktop progress');
+  assert.ok(reload.statuses.includes('Unsynced device saves preserved in history'));
+  assert.equal(Buffer.from(server.alternates[0].snapshot.files.find(file => file.path.endsWith('.save')).data, 'base64').toString(), 'offline mobile progress');
+});
+
+test('offline save progress publishes without conflict when only server preferences advanced', async () => {
+  const server = new Map(), mobileDatabases = new Map(), mobileMetadata = new Map();
+  const desktop = browser(server, new Map()); await desktop.start(); await desktop.save('first');
+  const mobile = browser(server, mobileDatabases, { metadata: mobileMetadata }); await mobile.start();
+  mobile.offline(true); await mobile.save('offline mobile progress');
+  desktop.fs.writeFile(`${root}/game/persistent`, Buffer.from('desktop preferences'));
+  await desktop.flush(); await desktop.retry();
+  assert.equal(server.get('A:X').revision, 2);
+  const reload = browser(server, mobileDatabases, { metadata: mobileMetadata }); await reload.start();
+  assert.equal(server.get('A:X').revision, 3);
+  assert.equal(Buffer.from(reload.fs.readFile(`${root}/game/1.save`)).toString(), 'offline mobile progress');
+  assert.ok(!reload.statuses.some(status => status.startsWith('Conflict')));
+});
+
+test('a lost acknowledgement remains valid after another device advances the server', async () => {
+  const server = new Map(), databases = new Map(), metadata = new Map();
+  const desktop = browser(server, databases, { metadata }); await desktop.start(); await desktop.save('first');
+  desktop.loseNextResponse(); desktop.fs.writeFile(`${root}/game/1.save`, Buffer.from('accepted desktop save')); await desktop.flush();
+  const mobile = browser(server, new Map()); await mobile.start(); await mobile.save('new mobile save');
+  const reload = browser(server, databases, { metadata }); await reload.start();
+  assert.equal(Buffer.from(reload.fs.readFile(`${root}/game/1.save`)).toString(), 'new mobile save');
+  assert.equal(server.alternates.length, 0);
+  assert.equal(server.get('A:X').revision, 3);
+});
+
+test('an evicted clean browser filesystem restores the server copy instead of publishing deletions', async () => {
+  const server = new Map(), databases = new Map(), metadata = new Map();
+  const a = browser(server, databases, { metadata }); await a.start(); await a.save('server progress');
+  databases.get(a.namespace).files.clear();
+  const reload = browser(server, databases, { metadata }); await reload.start();
+  assert.equal(Buffer.from(reload.fs.readFile(`${root}/game/1.save`)).toString(), 'server progress');
+  assert.equal(server.get('A:X').revision, 1);
 });

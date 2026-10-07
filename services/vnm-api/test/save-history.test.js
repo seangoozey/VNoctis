@@ -1,0 +1,136 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import Fastify from 'fastify';
+import { PrismaClient } from '@prisma/client';
+import savesRoutes from '../src/routes/saves.js';
+import { retainedIds, saveChecksum } from '../src/services/saveHistory.js';
+
+const encoded = value => Buffer.from(value).toString('base64');
+const autoSnapshot = step => ({ version: 1, files: [
+  ...Array.from({ length: 10 }, (_, index) => ({ path: `game/auto-${index + 1}-LT1.save`, mtime: 1000,
+    data: encoded(`progress ${Math.max(0, step - index)}`) })),
+  { path: 'game/persistent', mtime: 1000, data: encoded('preferences') },
+  { path: 'tokens/security_keys.txt', mtime: 1000, data: encoded('signing keys') },
+] });
+
+test('retention preserves 90 recent autosaves, separate manual history, and unresolved alternatives', () => {
+  const now = Date.UTC(2026, 9, 6, 12), hour = 3600000, day = 24 * hour;
+  const versions = [];
+  const add = (id, age, kind = 'auto', alternate = false) => versions.push({ id, kind, alternate, createdAt: new Date(now - age) });
+  for (let i = 0; i < 90; i++) add(`auto-${i}`, i * 120000);
+  for (let i = 0; i < 60; i++) add(`manual-${i}`, (i + 1) * day, 'manual');
+  add('hour-new', 2 * day + 5 * 60000); add('hour-old', 2 * day + 15 * 60000);
+  add('next-hour', 2 * day + hour + 5 * 60000);
+  add('day-new', 8 * day + hour); add('day-old', 8 * day + 2 * hour);
+  add('expired-auto', 31 * day); add('old-alternate', 365 * day, 'auto', true);
+  add('old-current', 365 * day);
+  const keep = retainedIds(versions, 'old-current', now);
+  assert.equal(versions.filter(v => v.id.startsWith('auto-') && keep.has(v.id)).length, 90);
+  assert.equal(versions.filter(v => v.kind === 'manual' && keep.has(v.id)).length, 40);
+  for (const id of ['hour-new', 'next-hour', 'day-new', 'old-alternate', 'old-current']) assert.ok(keep.has(id), id);
+  for (const id of ['hour-old', 'day-old', 'expired-auto']) assert.ok(!keep.has(id), id);
+});
+
+test('deduplicated server history restores rotating RenPy slots without adding files', async t => {
+  const directory = mkdtempSync(join(tmpdir(), 'vnm-history-'));
+  const prisma = new PrismaClient({ datasourceUrl: `file:${join(directory, 'test.db').replaceAll('\\', '/')}` });
+  const app = Fastify(); app.decorate('prisma', prisma);
+  try {
+    const migrations = new URL('../prisma/migrations/', import.meta.url);
+    for (const name of readdirSync(migrations).filter(name => name !== 'migration_lock.toml').sort()) {
+      const sql = readFileSync(new URL(`${name}/migration.sql`, migrations), 'utf8');
+      for (const statement of sql.split(';').filter(statement => statement.trim())) await prisma.$executeRawUnsafe(statement);
+    }
+    await prisma.user.createMany({ data: ['A', 'B'].map(id => ({ id, username: id, passwordHash: 'unused' })) });
+    for (const id of ['X', 'Y']) await prisma.$executeRawUnsafe('INSERT INTO Game (id,directoryPath,directoryName,extractedTitle,updatedAt) VALUES (?,?,?,?,?)', id, `/games/${id}`, id, id, new Date());
+    app.addHook('onRequest', async (request, reply) => {
+      if (!['A', 'B'].includes(request.headers.authorization)) return reply.code(401).send({});
+      request.user = { userId: request.headers.authorization };
+    });
+    await app.register(savesRoutes, { prefix: '/api/v1' });
+    const call = (method, path = '', payload, user = 'A', game = 'X') => app.inject({ method,
+      url: `/api/v1/games/${game}/saves${path}`, headers: { authorization: user }, payload });
+    const put = (revision, step, uploadId = `auto-${step}`, extra = {}) => call('PUT', '', {
+      revision, snapshot: autoSnapshot(step), uploadId, deviceLabel: 'Desktop browser', ...extra,
+    });
+    let firstId;
+    await t.test('90 autosaves retain every recent version while the live folder has only ten slots', async () => {
+      for (let step = 1; step <= 90; step++) {
+        const result = await put(step - 1, step);
+        assert.equal(result.statusCode, 200, result.body);
+        assert.equal(result.json().revision, step);
+        if (step === 1) firstId = result.json().versionId;
+      }
+      const live = (await call('GET')).json();
+      assert.equal(live.snapshot.files.filter(file => file.path.endsWith('.save')).length, 10);
+      assert.deepEqual(live.snapshot.files.map(file => file.path).sort(), autoSnapshot(90).files.map(file => file.path).sort());
+      assert.equal(await prisma.saveVersion.count(), 90);
+      assert.ok(await prisma.saveFileBlob.count() <= 93, 'rotating files share content blobs rather than duplicating ten files per version');
+      const first = (await call('GET', `/history/${firstId}`)).json();
+      assert.deepEqual(first.snapshot.files.map(file => file.path).sort(), autoSnapshot(1).files.map(file => file.path).sort());
+      assert.equal(first.snapshot.files.find(file => file.path === 'game/auto-1-LT1.save').data, encoded('progress 1'));
+      const page1 = (await call('GET', '/history')).json();
+      assert.equal(page1.versions.length, 50); assert.equal(page1.nextOffset, 50);
+      assert.equal((await call('GET', '/history?offset=50')).json().versions.length, 40);
+    });
+    await t.test('persistent-only updates do not fill history, and history is isolated by user and game', async () => {
+      const copy = autoSnapshot(90); copy.files.find(file => file.path.endsWith('persistent')).data = encoded('new preferences');
+      assert.equal((await call('PUT', '', { revision: 90, snapshot: copy, uploadId: 'preferences' })).json().revision, 91);
+      await call('GET', '/history');
+      assert.equal(await prisma.saveVersion.count(), 90);
+      assert.equal((await call('GET', '/history', undefined, 'B')).json().versions.length, 0);
+      for (const [method, path, body] of [['GET', `/history/${firstId}`], ['POST', `/history/${firstId}/restore`, { revision: 0, uploadId: 'attack' }], ['DELETE', `/history/${firstId}`]]) {
+        assert.equal((await call(method, path, body, 'B')).statusCode, 404);
+        assert.equal((await call(method, path, body, 'A', 'Y')).statusCode, 404);
+      }
+    });
+    let alternateId;
+    await t.test('independent saves become alternatives and lost responses stay acknowledged after later progress', async () => {
+      const alternate = await put(1, 999, 'phone-offline', { baseSaveChecksum: saveChecksum(autoSnapshot(1)), deviceLabel: 'Mobile browser' });
+      assert.equal(alternate.statusCode, 200);
+      assert.equal(alternate.json().disposition, 'alternate'); alternateId = alternate.json().versionId;
+      assert.equal((await call('GET')).json().revision, 91);
+      const repeat = await put(1, 999, 'phone-offline');
+      assert.equal(repeat.json().versionId, alternateId);
+      assert.equal(await prisma.saveVersion.count({ where: { alternate: true } }), 1);
+      const later = await put(1, 1000, 'phone-offline-later', { alternate: true, branchId: alternate.json().branchId, deviceLabel: 'Mobile browser' });
+      assert.equal(later.json().branchId, alternate.json().branchId);
+      assert.equal(await prisma.saveVersion.count({ where: { alternate: true } }), 2);
+      assert.equal((await put(0, 1, 'auto-1')).json().revision, 1);
+      assert.equal((await call('GET', '?uploadId=auto-1')).json().acknowledgement.revision, 1);
+      assert.equal((await call('GET')).json().revision, 91);
+    });
+    await t.test('restore preserves current progress and writes exactly the original ten-slot snapshot', async () => {
+      const stale = await call('POST', `/history/${firstId}/restore`, { revision: 90, uploadId: 'stale-restore' });
+      assert.equal(stale.statusCode, 409);
+      const response = await call('POST', `/history/${firstId}/restore`, { revision: 91, uploadId: 'restore-first' });
+      assert.equal(response.statusCode, 200, response.body); assert.equal(response.json().revision, 92);
+      const live = (await call('GET')).json();
+      assert.deepEqual(live.snapshot.files.map(file => file.path).sort(), autoSnapshot(1).files.map(file => file.path).sort());
+      assert.equal(live.snapshot.files.find(file => file.path === 'game/auto-1-LT1.save').data, encoded('progress 1'));
+      assert.equal(live.snapshot.files.find(file => file.path.startsWith('tokens/')).data, encoded('signing keys'));
+      assert.equal((await call('DELETE', `/history/${live.currentVersionId}`)).statusCode, 409);
+      const backup = await prisma.saveVersion.findFirst({ where: { userId: 'A', gameId: 'X', kind: 'checkpoint', revision: 91 } });
+      assert.ok(backup, 'exact current tree is backed up before restore');
+      assert.equal((await call('POST', `/history/${firstId}/restore`, { revision: 91, uploadId: 'restore-first' })).json().revision, 92);
+      const promote = await call('POST', `/history/${alternateId}/restore`, { revision: 92, uploadId: 'restore-alternate' });
+      assert.equal(promote.statusCode, 200);
+      assert.equal((await prisma.saveVersion.findUnique({ where: { id: alternateId } })).alternate, false);
+      assert.equal(await prisma.saveVersion.count({ where: { alternate: true } }), 0, 'restoring a continuation resolves its earlier alternatives too');
+    });
+    await t.test('deleted history releases unreferenced bytes but retains receipts and shared content', async () => {
+      const unique = await put(0, 5000, 'unique-alternate');
+      const id = unique.json().versionId, count = await prisma.saveFileBlob.count();
+      assert.equal((await call('DELETE', `/history/${id}`)).statusCode, 200);
+      assert.ok(await prisma.saveFileBlob.count() < count);
+      assert.ok(await prisma.saveVersionFile.count({ where: { hash: { in: (await prisma.saveFileBlob.findMany({ select: { hash: true } })).map(blob => blob.hash) } } }) > 0);
+      assert.equal((await put(0, 5000, 'unique-alternate')).json().versionId, id);
+      assert.equal((await call('GET', `/history/${id}`)).statusCode, 404);
+    });
+  } finally {
+    await app.close(); await prisma.$disconnect(); rmSync(directory, { recursive: true, force: true });
+  }
+});

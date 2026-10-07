@@ -4,9 +4,18 @@ const { createServer } = require('node:http');
 const { readFileSync } = require('node:fs');
 const { resolve, extname } = require('node:path');
 const assert = require('node:assert/strict');
+const { createHash } = require('node:crypto');
 
 const dist = resolve(__dirname, '../dist');
 let state = { revision: 0, snapshot: null };
+const versions = [], receipts = new Map();
+const saveHash = copy => createHash('sha256').update(JSON.stringify((copy?.files || []).filter(file => file.path.endsWith('.save'))
+  .map(file => [file.path, file.data]).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0))).digest('hex');
+const game = { id: 'X', extractedTitle: 'Fixture', buildStatus: 'built', webBuildPath: '/web-builds/test',
+  tags: [], screenshots: [], updatedAt: new Date().toISOString(), directoryName: 'fixture' };
+let role = 'viewer';
+let orphans = [{ userId: 'B', username: 'player', gameId: 'missing-game', gameTitle: 'Missing Game', revision: 1,
+  updatedAt: new Date().toISOString(), storedBytes: 2048 }];
 const token = `header.${Buffer.from(JSON.stringify({ userId: 'A' })).toString('base64url')}.signature`;
 const fixture = `<!DOCTYPE html><html><head><script src="/save-sync.js"></script></head><body><script>
   const files = new Map(), dirs = new Set(['/home/web_user/.renpy']);
@@ -15,7 +24,8 @@ const fixture = `<!DOCTYPE html><html><head><script src="/save-sync.js"></script
     stat: path => ({ mode: dirs.has(path) ? 0o40777 : 0o100666, mtime: new Date(1000) }),
     isDir: mode => (mode & 0o170000) === 0o40000,
     isFile: mode => (mode & 0o170000) === 0o100000,
-    readFile: path => files.get(path), writeFile: (path, bytes) => files.set(path, bytes),
+    readFile: path => files.get(path), writeFile: (path, bytes) => { files.set(path, bytes); FS.close({ path, flags: 1 }); },
+    close() {}, rename: (from, to) => { files.set(to, files.get(from)); files.delete(from); },
     mkdirTree: path => { const parts = path.split('/'); while(parts.length) { dirs.add(parts.join('/')); parts.pop(); } },
     utime() {}, unlink: path => files.delete(path), rmdir: path => dirs.delete(path),
     syncfs: (populate, callback) => queueMicrotask(() => callback(null))
@@ -32,15 +42,45 @@ const fixture = `<!DOCTYPE html><html><head><script src="/save-sync.js"></script
 const server = createServer(async (request, response) => {
   const url = new URL(request.url, 'http://localhost');
   const json = value => { response.setHeader('Content-Type', 'application/json'); response.end(JSON.stringify(value)); };
-  if (url.pathname === '/api/v1/auth/me') return json({ userId: 'A', username: 'test', role: 'viewer' });
+  if (url.pathname === '/api/v1/auth/me') return json({ userId: 'A', username: 'test', role });
+  if (url.pathname === '/api/v1/users') return json([]);
+  if (url.pathname === '/api/v1/admin/orphaned-saves') return json({ items: orphans, nextOffset: null });
+  if (url.pathname === '/api/v1/admin/orphaned-saves/B/missing-game') {
+    if (request.method === 'DELETE') { orphans = []; return json({ deleted: true }); }
+    return json({ version: 1, userId: 'B', gameId: 'missing-game', snapshot: { version: 1, files: [] } });
+  }
   if (url.pathname === '/api/v1/health') return json({ r2Mode: false });
-  if (url.pathname === '/api/v1/library/X') return json({ id: 'X', extractedTitle: 'Fixture', buildStatus: 'built', webBuildPath: '/web-builds/test' });
+  if (url.pathname === '/api/v1/library') return json([game]);
+  if (url.pathname === '/api/v1/library/X') return json(game);
+  if (url.pathname === '/api/v1/games/X/saves/history') return json({ currentRevision: state.revision,
+    currentVersionId: state.currentVersionId, versions: versions.map(({ snapshot, ...metadata }) => metadata), nextOffset: null });
+  const historyMatch = url.pathname.match(/^\/api\/v1\/games\/X\/saves\/history\/([^/]+)(\/restore)?$/);
+  if (historyMatch) {
+    const version = versions.find(version => version.id === historyMatch[1]);
+    if (!version) { response.statusCode = 404; return json({ message: 'Missing version' }); }
+    if (historyMatch[2]) {
+      let body = ''; for await (const chunk of request) body += chunk;
+      const restore = JSON.parse(body);
+      if (restore.revision !== state.revision) { response.statusCode = 409; return json({ message: 'Refresh history' }); }
+      state = { revision: state.revision + 1, snapshot: version.snapshot, currentVersionId: `version-${state.revision + 1}` };
+      versions.unshift({ ...version, id: state.currentVersionId, kind: 'restored', alternate: false, revision: state.revision, createdAt: new Date().toISOString() });
+      return json({ revision: state.revision });
+    }
+    if (request.method === 'DELETE') { versions.splice(versions.indexOf(version), 1); return json({ deleted: true }); }
+    return json({ version: 1, gameId: 'X', snapshot: version.snapshot });
+  }
   if (url.pathname === '/api/v1/games/X/saves') {
-    if (request.method === 'GET') return json(state);
+    if (request.method === 'GET') return json({ ...state, saveChecksum: saveHash(state.snapshot), acknowledgement: receipts.get(url.searchParams.get('uploadId')) || null });
     let body = ''; for await (const chunk of request) body += chunk;
     const upload = JSON.parse(body);
     if (upload.revision !== state.revision) { response.statusCode = 409; return json({}); }
-    state = { revision: state.revision + 1, snapshot: upload.snapshot }; return json(state);
+    const changedSlots = saveHash(state.snapshot) !== saveHash(upload.snapshot);
+    state = { revision: state.revision + 1, snapshot: upload.snapshot, uploadId: upload.uploadId,
+      currentVersionId: changedSlots ? `version-${state.revision + 1}` : state.currentVersionId };
+    if (changedSlots) versions.unshift({ id: state.currentVersionId, snapshot: upload.snapshot, kind: 'manual', alternate: false,
+      revision: state.revision, deviceLabel: 'Mobile browser', createdAt: new Date().toISOString(), byteSize: 100 });
+    const accepted = { revision: state.revision, disposition: 'current', saveChecksum: saveHash(upload.snapshot) };
+    receipts.set(upload.uploadId, accepted); return json(accepted);
   }
   if (url.pathname === '/web-builds/test/index.html') {
     response.setHeader('Content-Type', 'text/html'); return response.end(fixture);
@@ -87,5 +127,71 @@ const server = createServer(async (request, response) => {
     await toast.waitFor({ state: 'hidden' });
     assert.deepEqual(errors, []);
     console.log('PASS: built mobile player shows consecutive save acknowledgements, hides them, and keeps persistent-only sync quiet');
+    await page.goto(`http://127.0.0.1:${server.address().port}/admin/users`);
+    await page.waitForURL('**/gallery');
+    assert.equal(await page.getByRole('button', { name: 'Orphaned saves', exact: true }).count(), 0);
+    role = 'admin';
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await page.goto(`http://127.0.0.1:${server.address().port}/admin/users`);
+    await page.getByRole('button', { name: 'Orphaned saves', exact: true }).click();
+    const dialog = page.getByRole('dialog', { name: 'Orphaned saves', exact: true });
+    await dialog.getByText('Missing Game', { exact: true }).waitFor();
+    const downloadEvent = page.waitForEvent('download');
+    await dialog.getByRole('button', { name: 'Download snapshot' }).click();
+    const download = await downloadEvent;
+    assert.equal(JSON.parse(readFileSync(await download.path(), 'utf8')).gameId, 'missing-game');
+    await page.setViewportSize({ width: 375, height: 812 });
+    const bounds = await dialog.locator('div').first().boundingBox();
+    assert.ok(bounds.x >= 0 && bounds.x + bounds.width <= 375 && bounds.height <= 812);
+    await dialog.getByRole('button', { name: 'Delete', exact: true }).click();
+    await dialog.getByRole('button', { name: 'Cancel', exact: true }).click();
+    assert.equal(orphans.length, 1);
+    await dialog.getByRole('button', { name: 'Delete', exact: true }).click();
+    await dialog.getByRole('button', { name: 'Delete permanently', exact: true }).click();
+    await dialog.getByText('No orphaned saves.', { exact: true }).waitFor();
+    await page.keyboard.press('Escape');
+    await dialog.waitFor({ state: 'hidden' });
+    assert.deepEqual(errors, []);
+    console.log('PASS: admin overlay downloads snapshots, confirms deletion, fits mobile, and is hidden from viewers');
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await page.goto(`http://127.0.0.1:${server.address().port}/`);
+    await page.getByText('Fixture', { exact: true }).first().click();
+    await page.getByRole('button', { name: 'Save history', exact: true }).click();
+    const history = page.getByRole('dialog', { name: 'Save history', exact: true });
+    await history.getByText('Current', { exact: true }).waitFor();
+    const archiveDownload = page.waitForEvent('download');
+    await history.getByRole('button', { name: 'Download', exact: true }).last().click();
+    const archive = JSON.parse(readFileSync(await (await archiveDownload).path(), 'utf8'));
+    assert.equal(archive.snapshot.files.some(file => file.path.includes('quick-')), false);
+    await history.getByRole('button', { name: 'Restore', exact: true }).first().click();
+    await history.getByRole('button', { name: 'Restore this version', exact: true }).click();
+    await history.getByText('Version restored. Launch the game to use these saves.', { exact: true }).waitFor();
+    assert.equal(state.revision, 4);
+    assert.equal(state.snapshot.files.some(file => file.path.includes('quick-')), false);
+    await page.keyboard.press('Escape'); await history.waitFor({ state: 'hidden' });
+    assert.equal(await page.getByRole('button', { name: 'Save history', exact: true }).count(), 1, 'closing history keeps its launcher open');
+    role = 'viewer';
+    await page.goto(`http://127.0.0.1:${server.address().port}/gallery`);
+    await page.getByRole('button', { name: 'More Info', exact: true }).click();
+    await page.getByRole('button', { name: 'Save history', exact: true }).click();
+    await history.getByText('Current', { exact: true }).waitFor();
+    await page.setViewportSize({ width: 375, height: 812 });
+    const historyBounds = await history.locator('div').first().boundingBox();
+    assert.ok(historyBounds.x >= 0 && historyBounds.x + historyBounds.width <= 375 && historyBounds.height <= 812);
+    if (process.env.SCREENSHOT_PATH) await page.screenshot({ path: process.env.SCREENSHOT_PATH });
+    await history.getByRole('button', { name: 'Restore', exact: true }).first().click();
+    await history.getByRole('button', { name: 'Restore this version', exact: true }).click();
+    await history.getByText('Version restored. Launch the game to use these saves.', { exact: true }).waitFor();
+    await page.setViewportSize({ width: 812, height: 375 });
+    await history.getByRole('button', { name: 'Play with restored saves', exact: true }).click();
+    await page.waitForURL('**/gallery/play/X');
+    await page.waitForFunction(() => document.querySelector('iframe') !== null);
+    const restoredFrame = page.frames().find(frame => frame.url().includes('/web-builds/'));
+    await restoredFrame.waitForFunction(() => document.body.dataset.ready === 'true');
+    assert.deepEqual(await page.evaluate(() => [document.body.style.overflow, document.body.style.position]), ['', '']);
+    assert.equal(await restoredFrame.evaluate(() => new TextDecoder().decode(FS.readFile('/home/web_user/.renpy/game/quick-1-LT1.save'))), 'quick save');
+    assert.equal(state.revision, 5, 'launching restored progress must not upload an empty browser tree');
+    assert.deepEqual(errors, []);
+    console.log('PASS: both launchers download/restore personal history, fit mobile, and launch restored files without leaked scroll locks');
   } finally { if (browser) await browser.close(); server.close(); }
 })().catch(error => { console.error(error); process.exitCode = 1; });

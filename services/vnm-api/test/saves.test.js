@@ -43,10 +43,22 @@ test('SQLite migration and authenticated per-user/game revision API', async t =>
     // do not block this feature's id-only game access check.
     const migrations = new URL('../prisma/migrations/', import.meta.url);
     for (const name of readdirSync(migrations).filter(n => n !== 'migration_lock.toml').sort()) {
+      if (name === '20261007000000_save_sync_retention') {
+        await prisma.$executeRawUnsafe('INSERT INTO User (id,username,passwordHash,updatedAt) VALUES (?,?,?,?)', 'seed', 'seed', 'unused', new Date());
+        await prisma.$executeRawUnsafe('INSERT INTO Game (id,directoryPath,directoryName,extractedTitle,updatedAt) VALUES (?,?,?,?,?)', 'seed', '/games/seed', 'seed', 'Original Title', new Date());
+        await prisma.$executeRawUnsafe('INSERT INTO SaveSyncState (userId,gameId,revision,payload,checksum,updatedAt) VALUES (?,?,?,?,?,?)', 'seed', 'seed', 7, JSON.stringify(snapshot('existing progress')), 'existing-checksum', new Date());
+      }
       const sql = readFileSync(new URL(`${name}/migration.sql`, migrations), 'utf8');
       for (const statement of sql.split(';').filter(s => s.trim())) await prisma.$executeRawUnsafe(statement);
     }
+    const migrated = await prisma.saveSyncState.findUnique({ where: { userId_gameId: { userId: 'seed', gameId: 'seed' } } });
+    assert.equal(migrated.revision, 7); assert.equal(migrated.gameTitle, 'Original Title');
+    assert.equal(migrated.checksum, 'existing-checksum');
+    assert.deepEqual(JSON.parse(migrated.payload), snapshot('existing progress'));
+    await prisma.user.delete({ where: { id: 'seed' } });
+    await prisma.$executeRawUnsafe('DELETE FROM Game WHERE id = ?', 'seed');
     await prisma.user.createMany({ data: ['A', 'B'].map(id => ({ id, username: id, passwordHash: 'unused' })) });
+    await prisma.user.update({ where: { id: 'A' }, data: { role: 'admin' } });
     for (const id of ['X', 'Y']) await prisma.$executeRawUnsafe(
       'INSERT INTO Game (id,directoryPath,directoryName,extractedTitle,updatedAt) VALUES (?,?,?,?,?)', id, `/games/${id}`, id, id, new Date());
     app.addHook('onRequest', async (request, reply) => {
@@ -71,11 +83,12 @@ test('SQLite migration and authenticated per-user/game revision API', async t =>
       assert.equal((await get('A', 'absent')).statusCode, 404);
       assert.equal((await get('A', '..%2Fx')).statusCode, 400);
     });
-    await t.test('two concurrent writers cannot overwrite the same revision', async () => {
+    await t.test('concurrent progress preserves an alternate without overwriting the first writer', async () => {
       const results = await Promise.all([put('A', 1, snapshot('B')), put('A', 1, snapshot('C'))]);
-      assert.deepEqual(results.map(r => r.statusCode).sort(), [200, 409]);
+      assert.deepEqual(results.map(r => r.statusCode).sort(), [200, 200]);
+      assert.deepEqual(results.map(r => r.json().disposition).sort(), ['alternate', 'current']);
       assert.equal((await get('A')).json().revision, 2);
-      assert.equal((await put('A', 0)).statusCode, 409);
+      assert.equal((await put('A', 0)).json().revision, 1);
     });
     await t.test('invalid snapshot and oversized body leave server state intact', async () => {
       const copy = snapshot(); copy.files[0].path = '../attack';
@@ -84,10 +97,46 @@ test('SQLite migration and authenticated per-user/game revision API', async t =>
       assert.equal((await put('A', 2, huge)).statusCode, 413);
       assert.equal((await get('A')).json().revision, 2);
     });
-    await t.test('build output replacement does not remove saves; game deletion cascades', async () => {
+    await t.test('upload IDs acknowledge retries and reject reused IDs or competing progress', async () => {
+      const send = (revision, uploadId, copy = snapshot()) => app.inject({ method: 'PUT', url: '/api/v1/games/Y/saves',
+        headers: { authorization: 'B' }, payload: { revision, uploadId, snapshot: copy } });
+      assert.equal((await send(0, 'request-1')).json().revision, 1);
+      const retries = await Promise.all([send(0, 'request-1'), send(0, 'request-1')]);
+      assert.ok(retries.every(response => response.statusCode === 200 && response.json().revision === 1));
+      assert.equal((await send(1, 'request-1', snapshot('different'))).statusCode, 409);
+      assert.equal((await get('B', 'Y')).json().uploadId, 'request-1');
+      const newer = await send(1, 'request-2', snapshot('newer'));
+      assert.equal(newer.statusCode, 200, newer.body);
+      assert.equal(newer.json().revision, 2);
+      assert.equal((await send(0, 'request-1')).json().revision, 1, 'older retry acknowledges its original receipt');
+      assert.equal((await get('B', 'Y')).json().revision, 2, 'acknowledgement does not overwrite newer progress');
+    });
+    await t.test('missing games retain saves; admin cleanup protects active and returned games', async () => {
+      const admin = (method, path = '', payload, user = 'A') => app.inject({ method,
+        url: `/api/v1/admin/orphaned-saves${path}`, headers: { authorization: user }, payload });
       await prisma.$executeRawUnsafe('UPDATE Game SET webBuildPath = ? WHERE id = ?', '/web-builds/new-version', 'X');
       assert.equal((await get('A')).json().revision, 2);
+      assert.equal((await admin('DELETE', '/A/X', { revision: 2 })).statusCode, 409);
       await prisma.$executeRawUnsafe('DELETE FROM Game WHERE id = ?', 'X');
+      assert.equal((await get('A')).statusCode, 404);
+      assert.equal(await prisma.saveSyncState.count(), 2);
+      for (const [method, path, payload] of [['GET', ''], ['GET', '/A/X'], ['DELETE', '/A/X', { revision: 2 }]]) {
+        assert.equal((await admin(method, path, payload, 'B')).statusCode, 403);
+      }
+      const list = (await admin('GET')).json();
+      assert.equal(list.items.length, 1); assert.equal(list.items[0].gameTitle, 'X');
+      assert.equal(list.items[0].username, 'A'); assert.equal('payload' in list.items[0], false);
+      const stored = await prisma.saveSyncState.findUnique({ where: { userId_gameId: { userId: 'A', gameId: 'X' } } });
+      assert.deepEqual((await admin('GET', '/A/X')).json().snapshot, JSON.parse(stored.payload));
+      assert.equal((await admin('DELETE', '/A/X', { revision: 1 })).statusCode, 409);
+      await prisma.$executeRawUnsafe('INSERT INTO Game (id,directoryPath,directoryName,extractedTitle,updatedAt) VALUES (?,?,?,?,?)', 'X', '/games/X', 'X', 'X', new Date());
+      assert.equal((await get('A')).json().revision, 2);
+      assert.equal((await admin('GET')).json().items.length, 0);
+      assert.equal((await admin('GET', '/A/X')).statusCode, 404);
+      assert.equal((await admin('DELETE', '/A/X', { revision: 2 })).statusCode, 409);
+      await prisma.$executeRawUnsafe('DELETE FROM Game WHERE id = ?', 'X');
+      assert.equal((await admin('DELETE', '/A/X', { revision: 2 })).statusCode, 200);
+      await prisma.user.delete({ where: { id: 'B' } });
       assert.equal(await prisma.saveSyncState.count(), 0);
     });
   } finally {

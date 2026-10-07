@@ -19,6 +19,9 @@
   let initialized = false, blocked = false, busy = false, timer;
   let lastUploadedContents = null, lastStatus;
   let lastUploadedSlots = new Map();
+  let slotWritePending = false, urgentUploadPending = false;
+  let pendingUpload = null;
+  let acknowledgedSlots = null;
   let fs, nativeSync, originalGetDB;
   const status = (message, saveUploaded = false) => {
     if (message === lastStatus && !saveUploaded) return;
@@ -27,20 +30,29 @@
   };
   const slots = copy => new Map(copy.files.filter(file => file.path.endsWith('.save'))
     .map(file => [file.path, file.data]));
+  const slotContents = copy => JSON.stringify([...slots(copy)].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0));
+  async function checkpoint(copy, revision, saveChecksum = null) {
+    const next = { revision, contents: slotContents(copy), saveChecksum };
+    await outbox('put', next, 'baselines'); acknowledgedSlots = next;
+  }
   // Ren'Py may flush repeatedly or touch mtimes without changing save bytes.
   // Exact comparisons avoid hash collisions and work on HTTP LAN deployments.
   const contents = copy => JSON.stringify(copy.files.map(({ path, data }) => ({ path, data }))
     .sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
   const remember = () => localStorage.setItem(metaKey, JSON.stringify(meta));
-  const api = async (method, body) => {
+  const deviceLabel = /Mobi|Android|iPad/i.test(window.navigator?.userAgent || '') ? 'Mobile browser' : 'Desktop browser';
+  const requestFor = copy => ({ uploadId: window.crypto?.randomUUID?.() || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`,
+    revision: meta.revision, snapshot: copy, baseSaveChecksum: meta.baseSaveChecksum || null,
+    alternate: Boolean(meta.alternate), branchId: meta.branchId || null, deviceLabel });
+  const api = async (method, body, query = '') => {
     // Never upload an old session's filesystem using a newly logged-in account.
     if (localStorage.getItem('vnm-token') !== token) throw new Error('Account changed');
-    const response = await fetch(`/api/v1/games/${encodeURIComponent(gameId)}/saves`, {
+    const response = await fetch(`/api/v1/games/${encodeURIComponent(gameId)}/saves${query}`, {
       method, cache: 'no-store', signal: AbortSignal.timeout(8000),
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
       ...(body ? { body: JSON.stringify(body) } : {}),
     });
-    if (response.status === 409) { blocked = true; throw new Error('Conflict detected — browser saves preserved. Reload to choose a copy.'); }
+    if (response.status === 409) { blocked = true; throw new Error('Save upload could not be verified — device saves retained'); }
     if (!response.ok) throw new Error(`Save service unavailable (${response.status})`);
     return response.json();
   };
@@ -97,16 +109,23 @@
     }
   }
   const flush = () => new Promise((resolve, reject) => nativeSync(false, err => err ? reject(err) : resolve()));
-  function backup(copy) {
+  // Keep the exact request across network failures and reloads. Storing its
+  // potentially large snapshot in IndexedDB avoids localStorage's small quota.
+  function outbox(operation, value, storeName = 'uploads') {
     return new Promise((resolve, reject) => {
-      const req = indexedDB.open('vnm-save-backups', 1);
-      req.onupgradeneeded = () => req.result.createObjectStore('snapshots');
+      const req = indexedDB.open('vnm-save-outbox', 2);
+      req.onupgradeneeded = () => {
+        for (const name of ['uploads', 'baselines']) {
+          if (!req.result.objectStoreNames.contains(name)) req.result.createObjectStore(name);
+        }
+      };
       req.onerror = () => reject(req.error);
       req.onsuccess = () => {
         const db = req.result;
-        const tx = db.transaction('snapshots', 'readwrite');
-        tx.objectStore('snapshots').put(copy, `${namespace}:${Date.now()}`);
-        tx.oncomplete = () => { db.close(); resolve(); };
+        const tx = db.transaction(storeName, operation === 'get' ? 'readonly' : 'readwrite');
+        const store = tx.objectStore(storeName);
+        const action = operation === 'put' ? store.put(value, namespace) : store[operation](namespace);
+        tx.oncomplete = () => { db.close(); resolve(action.result); };
         tx.onabort = () => { db.close(); reject(tx.error); };
       };
     });
@@ -116,10 +135,16 @@
     return new Promise(resolve => {
       const panel = document.createElement('div');
       panel.style.cssText = 'position:fixed;inset:0;z-index:2147483647;background:#111e;color:white;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;padding:24px;font:16px sans-serif';
-      const text = document.createElement('p'); text.textContent = message; panel.append(text);
-      for (const [label, value] of options) {
+      const text = document.createElement('p'); text.textContent = message;
+      text.style.cssText = 'width:100%;max-width:480px;line-height:1.5'; panel.append(text);
+      for (const [label, value, description] of options) {
         const button = document.createElement('button'); button.textContent = label;
-        button.style.cssText = 'padding:12px;background:#334155;color:white;border:1px solid #94a3b8;border-radius:6px;cursor:pointer';
+        button.style.cssText = `width:100%;max-width:480px;padding:16px;text-align:left;background:${value === 'server' ? '#047857' : '#334155'};color:white;border:1px solid #94a3b8;border-radius:6px;cursor:pointer;font:inherit`;
+        if (description) {
+          const detail = document.createElement('span'); detail.textContent = description;
+          detail.style.cssText = 'display:block;margin-top:6px;font-size:14px;line-height:1.5;opacity:.85';
+          button.append(detail);
+        }
         button.onclick = () => { panel.remove(); resolve(value); }; panel.append(button);
       }
       document.body.append(panel);
@@ -147,37 +172,61 @@
       }) };
   }
   async function start() {
-    const local = snapshot();
+    let local = snapshot();
     if (!meta.dirty) {
       lastUploadedContents = contents(local);
       lastUploadedSlots = slots(local);
     }
     try {
-      const remote = await api('GET');
-      lastUploadedContents = contents(remote.snapshot || { files: [] });
-      lastUploadedSlots = slots(remote.snapshot || { files: [] });
-      if (remote.snapshot && local.files.length && (meta.dirty || meta.revision === 0)) {
-        if (remote.revision !== meta.revision || meta.revision === 0) {
-          const choice = await choose('Save conflict: this browser and server both have progress.', [
-            ['Continue with browser copy (sync paused)', 'local'],
-            ['Use server copy (back up browser copy first)', 'server'],
-          ]);
-          if (choice === 'local') { blocked = true; status('Conflict detected — browser saves only'); return; }
-          await backup(local);
-          restore(remote.snapshot); await flush();
-          meta = { revision: remote.revision, dirty: false }; remember();
+      pendingUpload = await outbox('get') || null;
+      acknowledgedSlots = await outbox('get', undefined, 'baselines') || null;
+      if (pendingUpload) { meta.revision = pendingUpload.revision; meta.dirty = true; }
+      else if (acknowledgedSlots && acknowledgedSlots.revision > meta.revision) meta.revision = acknowledgedSlots.revision;
+      let remote = await api('GET', null, pendingUpload ? `?uploadId=${encodeURIComponent(pendingUpload.uploadId)}` : '');
+      let preserved = false;
+      // Receipts outlive history pruning and later writes by other devices.
+      if (pendingUpload) {
+        if (!local.files.length && pendingUpload.snapshot.files.length) {
+          local = pendingUpload.snapshot; restore(local); await flush();
         }
-      } else if (remote.snapshot) {
-        if (local.files.length) await backup(local);
-        restore(remote.snapshot); await flush();
-        meta = { revision: remote.revision, dirty: false }; remember();
-      } else if (!local.files.length) {
-        const legacy = await legacyCopy();
-        if (legacy) { restore(legacy); await flush(); meta.dirty = true; remember(); }
+        const result = remote.acknowledgement || await api('PUT', pendingUpload);
+        preserved = result.disposition === 'alternate';
+        await acknowledge(pendingUpload.snapshot, result);
+        remote = await api('GET');
       }
-      // Existing isolated browser saves with no server record are safely imported.
-      if (!remote.snapshot && snapshot().files.length) { meta.revision = 0; meta.dirty = true; remember(); }
-      if (!meta.dirty) status('Saves synced');
+      if (!remote.snapshot && !local.files.length) {
+        const legacy = await legacyCopy();
+        if (legacy) { local = legacy; restore(local); await flush(); meta.dirty = true; remember(); }
+      }
+      const knownBaseline = acknowledgedSlots?.revision === meta.revision;
+      const slotChanges = knownBaseline ? meta.dirty && acknowledgedSlots.contents !== slotContents(local)
+        : (meta.dirty || meta.revision === 0) && local.files.length > 0;
+      const slotsAgree = remote.snapshot && slotContents(local) === slotContents(remote.snapshot);
+      const needsUpload = !remote.snapshot ? local.files.length > 0 : !slotsAgree &&
+        (slotChanges || (meta.alternate && meta.dirty));
+      if (needsUpload) {
+        // Publish one-sided offline progress, or preserve it as an alternate if
+        // another device also advanced. Neither case needs a blocking choice.
+        if (knownBaseline && acknowledgedSlots.contents === slotContents(remote.snapshot || { files: [] })) {
+          meta.baseSaveChecksum = remote.saveChecksum;
+        }
+        const next = requestFor(local);
+        await outbox('put', next); pendingUpload = next;
+        const result = await api('PUT', next);
+        preserved ||= result.disposition === 'alternate';
+        await acknowledge(local, result);
+        remote = await api('GET');
+      }
+      if (remote.snapshot) {
+        restore(remote.snapshot); await flush();
+        await checkpoint(remote.snapshot, remote.revision, remote.saveChecksum);
+        meta = { revision: remote.revision, dirty: false, baseSaveChecksum: remote.saveChecksum, alternate: false }; remember();
+        lastUploadedContents = contents(remote.snapshot); lastUploadedSlots = slots(remote.snapshot);
+      } else {
+        await checkpoint({ version: 1, files: [] }, 0, remote.saveChecksum);
+        meta.revision = 0; meta.baseSaveChecksum = remote.saveChecksum; remember();
+      }
+      status(preserved ? 'Unsynced device saves preserved in history' : 'Saves synced');
     } catch (error) {
       // Unknown server revision must never become permission to overwrite it later.
       // Restore failures also leave the previously loaded local files available.
@@ -185,13 +234,23 @@
       status('Offline — browser saves only');
     }
   }
+  async function acknowledge(copy, result) {
+    const alternate = result.disposition === 'alternate';
+    const base = alternate ? meta.baseSaveChecksum || null : result.saveChecksum;
+    await checkpoint(copy, result.revision, base);
+    await outbox('delete'); pendingUpload = null;
+    meta.revision = result.revision; meta.baseSaveChecksum = base; meta.alternate = alternate;
+    meta.branchId = alternate ? result.branchId : null;
+    meta.dirty = contents(snapshot()) !== contents(copy); remember();
+    lastUploadedContents = contents(copy); lastUploadedSlots = slots(copy);
+  }
   async function upload() {
     if (!initialized || blocked || busy || !meta.dirty) return;
     busy = true;
     let syncingNotice;
     try {
-      const copy = snapshot(); const copyContents = contents(copy);
-      if (copyContents === lastUploadedContents) {
+      const copy = pendingUpload?.snapshot || snapshot(); const copyContents = contents(copy);
+      if (!pendingUpload && copyContents === lastUploadedContents) {
         meta.dirty = false; remember();
         return;
       }
@@ -199,17 +258,32 @@
       // Only server-acknowledged additions/changes qualify; deletions do not.
       const saveUploaded = copy.files.some(file => file.path.endsWith('.save') &&
         lastUploadedSlots.get(file.path) !== file.data);
+      if (!pendingUpload) {
+        // Alternate continuations retain real save changes, without archiving
+        // every seen-text/preference flush as another unresolved alternative.
+        if (meta.alternate && slotContents(copy) === acknowledgedSlots?.contents) {
+          meta.dirty = false; remember(); return;
+        }
+        const next = requestFor(copy);
+        await outbox('put', next); pendingUpload = next;
+      }
       // Fast background uploads should not flash the status on each interaction.
       syncingNotice = setTimeout(() => status('Syncing…'), 500);
-      const result = await api('PUT', { revision: meta.revision, snapshot: copy });
+      const result = await api('PUT', pendingUpload);
       clearTimeout(syncingNotice);
-      lastUploadedContents = copyContents;
-      lastUploadedSlots = slots(copy);
-      meta.revision = result.revision;
-      meta.dirty = contents(snapshot()) !== copyContents;
-      remember(); status(meta.dirty ? 'Syncing…' : 'Saves synced', saveUploaded);
+      await acknowledge(copy, result);
+      const current = snapshot();
+      meta.dirty = contents(current) !== copyContents;
+      if (current.files.some(file => file.path.endsWith('.save') && lastUploadedSlots.get(file.path) !== file.data)) {
+        urgentUploadPending = true;
+      }
+      remember(); status(result.disposition === 'alternate' ? 'Save backed up as alternate version'
+        : meta.dirty ? 'Syncing…' : 'Saves synced', saveUploaded);
     } catch (error) { status(blocked ? error.message : 'Offline — browser saves only'); }
-    finally { clearTimeout(syncingNotice); busy = false; }
+    finally {
+      clearTimeout(syncingNotice); busy = false;
+      if (urgentUploadPending) { urgentUploadPending = false; upload(); }
+    }
   }
   window.Module = window.Module || {};
   const oldPreInit = Module.preInit;
@@ -219,6 +293,22 @@
     originalGetDB = IDBFS.getDB.bind(IDBFS);
     IDBFS.getDB = (name, callback) => originalGetDB(name === root ? namespace : name, callback);
     nativeSync = fs.syncfs.bind(fs);
+    const isSaveSlot = path => typeof path === 'string' && path.startsWith(`${root}/`) && path.endsWith('.save');
+    // Ren'Py writes slots directly or renames a temporary file into place.
+    // Watch these operations without scanning/encoding the tree on every frame.
+    const nativeClose = fs.close.bind(fs);
+    fs.close = stream => {
+      const wroteSlot = initialized && (stream.flags & 3) !== 0 && isSaveSlot(stream.path);
+      const result = nativeClose(stream);
+      if (wroteSlot) slotWritePending = true;
+      return result;
+    };
+    const nativeRename = fs.rename.bind(fs);
+    fs.rename = (from, to) => {
+      const result = nativeRename(from, to);
+      if (initialized && isSaveSlot(to)) slotWritePending = true;
+      return result;
+    };
     fs.syncfs = (populate, callback = () => {}) => {
       if (!populate && initialized) {
         meta.dirty = true;
@@ -229,16 +319,31 @@
         if (populate && !initialized) {
           start().finally(() => {
             initialized = true; callback(null);
-            timer = setInterval(upload, 5000); upload();
+            resume();
           });
         } else {
-          // Keep browser writes immediate; coalesce server uploads on the five
-          // second interval instead of uploading on every filesystem flush.
+          // Start slot uploads only after their browser storage flush succeeds.
+          // Persistent-only writes retain the five-second batching interval.
+          const urgent = !populate && slotWritePending;
+          if (urgent) slotWritePending = false;
           callback(null);
+          if (urgent) {
+            if (busy) urgentUploadPending = true;
+            else upload();
+          }
         }
       });
     };
   }];
+  function resume() {
+    if (!initialized) return;
+    clearInterval(timer); timer = setInterval(upload, 5000); upload();
+  }
   window.addEventListener('online', upload);
-  window.addEventListener('pagehide', () => { clearInterval(timer); });
+  window.addEventListener('pagehide', () => { clearInterval(timer); timer = undefined; upload(); });
+  window.addEventListener('pageshow', resume);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') resume();
+    else upload();
+  });
 })();

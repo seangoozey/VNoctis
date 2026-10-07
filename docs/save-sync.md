@@ -3,7 +3,9 @@
 The authenticated `/play/:gameId` player synchronizes browser saves with VNoctis.
 Saves are keyed by the authenticated user ID and stable database game ID, independent
 of the web-build directory. Rebuilding or removing build output does not remove
-server snapshots. Deleting a library Game or User deletes its snapshots by cascade.
+server snapshots. Removing a library Game retains its snapshots as orphaned saves;
+rediscovering the same game ID makes them available again. Deleting a User still
+deletes that account's snapshots by cascade.
 
 ## Persistence investigation
 
@@ -46,27 +48,32 @@ Sources: [official 8.5.2 web package](https://www.renpy.org/dl/8.5.2/renpy-8.5.2
 
 ## API and storage
 
-`GET /api/v1/games/:gameId/saves` returns `{ revision, snapshot }`; an absent
-record has revision zero and a null snapshot. Responses are not cacheable.
+`GET /api/v1/games/:gameId/saves` returns the live revision, snapshot, slot
+checksum, and current history version ID. An absent record has revision zero and
+a null snapshot. `?uploadId=...` also returns that upload's durable receipt.
+Responses are not cacheable.
 
-`PUT /api/v1/games/:gameId/saves` accepts `{ revision, snapshot }` and returns
-the incremented revision. A snapshot is `{ version: 1, files: [{ path, mtime,
+`PUT /api/v1/games/:gameId/saves` accepts `{ revision, snapshot, uploadId,
+baseSaveChecksum, deviceLabel, alternate, branchId }`. It returns the accepted
+revision, current server revision, history ID, and `current` or `alternate`
+disposition. A snapshot is `{ version: 1, files: [{ path, mtime,
 data }] }`, where paths are relative to the mount, times are milliseconds, and
 data is opaque base64. Directories are reconstructed. Empty directories are not
 required for save validity. Deletions are represented by absence from the next
 complete snapshot.
 
 `SaveSyncState` stores a bounded JSON manifest and SHA-256 checksum in SQLite.
-This uses the existing backup/migration path, and avoids DB/filesystem consistency
-and orphan cleanup problems. Base64 costs roughly 33% extra storage and each
-change uploads the full save tree; this is intentionally a bounded first version,
-not a game-asset archive protocol. Limits are 32 MiB decoded bytes, 4096 files,
+This uses the existing SQLite backup/migration path. Each upload still sends the
+full save tree. Limits are 32 MiB decoded bytes, 4096 files,
 512-character relative paths, and a 46 MiB HTTP body. Files are never unpickled,
 unzipped, or written to server filesystem paths.
 
-Creation uses a unique `(userId, gameId)` key. Updates use an atomic conditional
-revision update. Stale writers receive HTTP 409 and stop uploading; they cannot
-silently replace the server. The server ignores body user IDs and derives identity
+Creation uses a unique `(userId, gameId)` key. Save transactions are serialized
+for SQLite and store live state, immutable history, and receipts together. A stale
+writer can advance live state only when the server's actual slots still match its
+acknowledged baseline, or its incoming slots already match the server. Otherwise
+its snapshot is preserved as an alternate without replacing live state. The
+server ignores body user IDs and derives identity
 from the existing verified session. Parameter validation and a game existence
 check precede save access.
 
@@ -81,8 +88,13 @@ stays untouched. On shared browsers, import only saves you own. Selecting the
 wrong folder cannot be detected automatically.
 
 Offline edits keep their last acknowledged server revision and a dirty flag.
-Browser filesystem writes remain immediate. Server uploads are batched every
-five seconds and retried on reconnect. Unchanged file contents and timestamp-only
+Browser filesystem writes remain immediate. Written or atomically renamed
+`.save` slots trigger a server upload as soon as the browser filesystem flush
+succeeds. A slot written during an upload follows immediately after its
+acknowledgement. Persistent-only writes are batched every five seconds, and
+failed uploads are retried on that interval and on reconnect. Closing or killing
+the tab during a transfer can still interrupt it; unacknowledged browser data
+remains dirty for the next launch. Unchanged file contents and timestamp-only
 touches do not upload or increment the server revision. Persistent-only changes
 still synchronize even when no numbered save slot is created. The status remains
 steady for fast uploads; “Syncing…” appears if a transfer takes over half a second.
@@ -94,15 +106,97 @@ slot deletions do not bring it back. New offline/conflict/error
 states briefly reveal it for eight seconds; recovery reveals it for four seconds.
 Requests time out after eight
 seconds; failure does not block gameplay or erase browser data. On reload, dirty
-local data is retained if the server revision still matches. If it differs,
-the startup prompt offers local play with sync paused or the server copy.
-The latter first commits the browser tree to the `vnm-save-backups` IndexedDB
-database (`snapshots` store, keys prefixed with the user/game namespace). These
-backups are retained; there is no backup browsing UI in this first version.
+local data is retained if the service cannot be reached. The browser records the
+exact acknowledged `.save` bytes and server slot checksum in IndexedDB. On launch,
+pending uploads are acknowledged or replayed first. Unsynced actual save progress
+then uploads normally or is archived as an alternate if another device advanced.
+The current server snapshot loads automatically afterward; there is no blocking
+save-conflict choice. Unsynced seen-text/preferences alone do not create divergent
+save progress. A running game can keep playing its alternate continuation and
+back up subsequent slot changes; the next launch returns to synced saves.
+Older `vnm-save-backups` databases are left untouched, but new recovery copies are
+kept in server history instead.
 
-Do not automatically retry a rejected upload with a newer revision: that would
-turn conflict detection into an implicit last-writer-wins overwrite. Reload to
-choose a copy. Login changes cannot make an old running game's bridge upload
+Pending requests retain their upload ID, revision, and exact snapshot in the
+`vnm-save-outbox` IndexedDB database. Retrying an acknowledged upload returns the
+same accepted revision when its ID and checksum match its receipt, even if another
+device advanced or that history version expired. Reusing an ID for different
+bytes is rejected. On launch, a receipt also acknowledges a lost response. Offline save
+writes remain local and retry after connectivity returns; the game itself still
+needs its assets available to run offline.
+
+`pageshow` and return to visible state restart exactly one retry timer and attempt
+pending uploads. Hiding/leaving a page also attempts an upload, but browser
+termination cannot guarantee delivery.
+
+## Server save history
+
+Both library and gallery game launchers have a **Save history** button. The list
+belongs to the signed-in user and that game, including for administrators; admins
+do not see other users' active-game history here. Versions show save type, device
+label, time, logical snapshot size, and a Current badge. Download exports a JSON
+snapshot. Restore is confirmed and creates a new live version, preserving the
+exact prior live tree. It is used on the next game launch. A stale restore dialog
+must refresh rather than overwrite an intervening save. Non-current versions can
+be explicitly deleted.
+
+History is outside Ren'Py's mounted filesystem. The engine's rotating ten
+autosave slots and original filenames are unchanged. A historical restore
+reconstructs exactly that version's original slots, persistent data, and tokens;
+it never adds ninety autosave files to the live folder.
+
+`SaveVersion` metadata and `SaveVersionFile` manifests refer to `SaveFileBlob`
+rows keyed by SHA-256 of decoded file bytes. Identical content is shared even
+across renamed/rotated slots. Removing versions garbage-collects only blobs with
+no remaining references. Each manifest is immutable; the live snapshot remains
+separate. Existing synced data is archived lazily on first access/replacement.
+History cannot recover saves overwritten before deployment.
+
+Retention is applied on writes/history access and by hourly maintenance:
+
+- Autosave/checkpoint versions from the past 24 hours: keep all.
+- Older versions through seven days: keep the newest per hour containing saves.
+- Older versions through thirty days: keep the newest per day containing saves.
+- Manual/quick saves and explicit restores: keep their newest 40 independently.
+- Current live version: always keep.
+- Unresolved alternate continuations: keep until explicitly restored or deleted.
+
+Hour/day buckets use UTC; the UI displays dates in the browser's local timezone.
+Restoring an alternate resolves its continuation's earlier alternatives too;
+those retained snapshots then follow their normal time/count policy. Actual slot
+changes (including deletion) create history. Persistent-only writes keep syncing
+but do not fill history. An initial checkpoint or pre-restore backup can capture
+the complete current tree separately. Small upload receipts are retained until
+the user or that game's orphaned saves are deleted, independently of history
+expiry, so retries remain idempotent.
+
+History captures snapshots received by the server. While offline, Ren'Py retains
+its normal local rotating slots and the bridge retains pending/latest progress;
+it does not archive every intermediate offline autosave. The latest offline
+continuation is preserved when connectivity returns. Game assets must already
+be available for offline play.
+
+## Orphaned save administration
+
+The admin navigation's **Saves** button opens an overlay styled like Import Game.
+It lists orphaned snapshots by game title, owner, date, and stored size, with
+download and individually confirmed deletion. Active games are excluded.
+Each API operation verifies the current database admin role. A deletion checks
+both the listed revision and continued absence of the game in one atomic SQL
+statement, so a stale overlay cannot purge a returned game's saves. Lists are
+paged at 50 entries; full payloads are fetched only for downloads.
+
+Deleting orphaned saves also deletes that user's history and receipts for the
+game, without removing shared content still referenced by another user/version.
+Downloads are the current versioned JSON snapshot containing opaque save bytes and game
+identity, not a native Ren'Py save ZIP. No reassignment/import UI or active-game
+purge is included. The live snapshot has no automatic expiration; history follows
+the retention policy above. Renaming a
+game directory changes its fingerprint ID, so it does not automatically reclaim
+the old directory's saves.
+
+Do not bump revisions to force a divergent upload into live state: it must be
+preserved as an alternate instead. Login changes cannot make an old running game's bridge upload
 its files using a new account's token.
 
 ## Compatibility and limits
@@ -135,11 +229,15 @@ Run `npm test` in each service and `npm run build` in `services/vnm-ui`.
 Run `npm run test:player` in the UI for the built React player plus bridge test
 in mobile-sized Chromium. It verifies that the startup toast disappears,
 persistent-only uploads stay quiet, consecutive save acknowledgements become
-visible, and notices can be dismissed. This uses a filesystem fixture, not a VN.
+visible, and notices can be dismissed. It also verifies the admin overlay and
+library/gallery history download/restore controls, including mobile sizing and
+nested modal dismissal. This uses a filesystem fixture, not a VN.
 Set `CHROME_PATH` to an existing Chrome executable or install Playwright Chromium.
 API tests apply all committed SQL migrations to a temporary SQLite database,
 then verify authentication gating, user/game isolation, stale and concurrent
-writers, traversal/payload limits, build-path changes, and cascading deletion.
+writers, traversal/payload limits, build-path changes, retention across 90 rotating
+autosaves, deduplication, exact restoration, orphan retention/admin cleanup, and
+account deletion. History/restore access is isolated by both user and game.
 Bridge tests exercise device handoff, offline save/reload/reconnect, competing
 sessions, selected-folder legacy import, and declining import.
 

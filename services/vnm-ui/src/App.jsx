@@ -12,6 +12,7 @@ import Login from './pages/Login';
 import UserManagement from './pages/UserManagement';
 import R2Settings from './pages/R2Settings';
 import ImportGameModal from './components/ImportGameModal';
+import OrphanedSavesModal from './components/OrphanedSavesModal';
 import useTheme from './hooks/useTheme';
 
 /**
@@ -84,6 +85,7 @@ function AppContent() {
   const { user, logout, isAuthenticated, isAdmin } = useAuth();
   const [showImportModal, setShowImportModal] = useState(false);
   const [showR2Modal, setShowR2Modal] = useState(false);
+  const [showOrphanedSaves, setShowOrphanedSaves] = useState(false);
   const [r2Mode, setR2Mode] = useState(false);
   const location = useLocation();
 
@@ -107,6 +109,7 @@ function AppContent() {
       {!isLoginPage && !isFullscreenPage && isAuthenticated && (
         <Navbar
           onImport={() => setShowImportModal(true)}
+          onOrphanedSaves={() => setShowOrphanedSaves(true)}
           onR2Settings={() => setShowR2Modal(true)}
           isDark={isDark}
           onToggleTheme={toggleTheme}
@@ -183,6 +186,9 @@ function AppContent() {
       )}
 
       {/* R2 Settings modal (admin only) */}
+      {!isLoginPage && isAdmin && showOrphanedSaves && (
+        <OrphanedSavesModal onClose={() => setShowOrphanedSaves(false)} />
+      )}
       {!isLoginPage && isAdmin && r2Mode && (
         <R2Settings
           open={showR2Modal}

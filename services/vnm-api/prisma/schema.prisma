@@ -38,7 +38,6 @@ model Game {
   createdAt         DateTime       @default(now())
   updatedAt         DateTime       @updatedAt
   favoritedBy       UserFavorite[]                        // Per-user favorites (replaces global favorite)
-  saves             SaveSyncState[]
 }
 
 model User {
@@ -50,19 +49,85 @@ model User {
   updatedAt    DateTime       @updatedAt
   favorites    UserFavorite[]
   saves        SaveSyncState[]
+  saveVersions SaveVersion[]
+  saveReceipts SaveUploadReceipt[]
 }
 
 model SaveSyncState {
   userId    String
   gameId    String
+  gameTitle String   @default("")
+  uploadId  String?
+  currentVersionId String?
   revision  Int      @default(1)
   payload   String   // Versioned file manifest; file bytes are opaque base64.
   checksum  String
   updatedAt DateTime @updatedAt
   user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  game      Game     @relation(fields: [gameId], references: [id], onDelete: Cascade)
 
   @@id([userId, gameId])
+}
+
+// History is separate from the live Ren'Py filesystem. Identical file bytes
+// are shared by manifests even when Ren'Py rotates them between autosave slots.
+model SaveFileBlob {
+  hash     String @id
+  data     Bytes
+  size     Int
+  files    SaveVersionFile[]
+}
+
+model SaveVersion {
+  id           String   @id @default(uuid())
+  userId       String
+  gameId       String
+  gameTitle    String
+  kind         String   // auto | manual | checkpoint | restored
+  alternate    Boolean  @default(false)
+  branchId     String?
+  baseRevision Int
+  revision     Int
+  deviceLabel  String
+  checksum     String
+  saveChecksum String
+  byteSize     Int
+  restoredFrom String?
+  createdAt    DateTime @default(now())
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  files        SaveVersionFile[]
+
+  @@index([userId, gameId, createdAt])
+  @@index([userId, gameId, branchId])
+}
+
+model SaveVersionFile {
+  versionId String
+  path      String
+  mtime     Float
+  hash      String
+  version   SaveVersion @relation(fields: [versionId], references: [id], onDelete: Cascade)
+  blob      SaveFileBlob @relation(fields: [hash], references: [hash])
+
+  @@id([versionId, path])
+  @@index([hash])
+}
+
+// Lightweight receipts outlive pruned history so lost-response retries remain
+// idempotent even after another device saves or a version expires.
+model SaveUploadReceipt {
+  userId      String
+  gameId      String
+  uploadId    String
+  checksum    String
+  revision    Int
+  disposition String
+  versionId   String?
+  branchId    String?
+  saveChecksum String
+  createdAt   DateTime @default(now())
+  user        User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([userId, gameId, uploadId])
 }
 
 model UserFavorite {

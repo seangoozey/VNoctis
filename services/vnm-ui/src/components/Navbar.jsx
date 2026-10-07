@@ -12,7 +12,7 @@ import { Link } from 'react-router-dom';
  *   onLogout?: () => void,
  * }} props
  */
-export default function Navbar({ onImport, onR2Settings, isDark = true, onToggleTheme, username, onLogout, isAdmin = false, r2Mode = false }) {
+export default function Navbar({ onImport, onOrphanedSaves, onR2Settings, isDark = true, onToggleTheme, username, onLogout, isAdmin = false, r2Mode = false }) {
   return (
     <nav className="fixed top-0 left-0 right-0 z-50 h-16 bg-white dark:bg-gray-900 border-b border-gray-200 dark:border-gray-800 flex items-center justify-between px-3 sm:px-6 shadow-lg transition-colors duration-200">
       {/* Left: App title — clickable, navigates to admin library */}
@@ -102,6 +102,13 @@ export default function Navbar({ onImport, onR2Settings, isDark = true, onToggle
         )}
 
         {/* R2 Settings button (admin + R2 mode only) */}
+        {isAdmin && onOrphanedSaves && (
+          <button onClick={onOrphanedSaves} title="Orphaned saves" aria-label="Orphaned saves"
+            className="flex items-center gap-2 px-2 sm:px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-medium rounded-lg transition-colors duration-200">
+            <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path d="M4 8h16v12H4zM3 4h18v4H3zm6 8h6" /></svg>
+            <span className="hidden sm:inline">Saves</span>
+          </button>
+        )}
         {isAdmin && r2Mode && onR2Settings && (
           <button
             onClick={onR2Settings}
