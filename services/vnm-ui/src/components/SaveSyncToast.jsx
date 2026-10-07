@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 
-/** Brief status notice; routine background sync never repeatedly reveals it. */
-export default function SaveSyncToast({ message }) {
+/** Brief notices for startup, acknowledged save slots, and sync problems. */
+export default function SaveSyncToast({ message, saveNoticeId }) {
   const [visible, setVisible] = useState(true);
   const routine = message === 'Starting save sync…' || message === 'Syncing…' || message === 'Saves synced';
   const issue = routine ? null : message;
@@ -10,12 +10,12 @@ export default function SaveSyncToast({ message }) {
     setVisible(true);
     const timeout = setTimeout(() => setVisible(false), issue ? 8000 : 4000);
     return () => clearTimeout(timeout);
-  }, [issue]);
+  }, [issue, saveNoticeId]);
 
   if (!visible) return null;
   return (
     <div role="status" className="absolute bottom-3 left-3 right-3 w-fit max-w-[calc(100%-1.5rem)] z-10 flex items-center gap-2 bg-gray-900/90 text-white text-xs rounded px-3 py-1">
-      <span>{message === 'Saves synced' ? 'Saved files synced' : message}</span>
+      <span>{!issue && saveNoticeId > 0 ? 'Save synced' : message === 'Saves synced' ? 'Saved files synced' : message}</span>
       <button
         type="button"
         aria-label="Dismiss save sync notice"

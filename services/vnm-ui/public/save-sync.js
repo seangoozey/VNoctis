@@ -18,12 +18,15 @@
   catch { meta = { revision: 0, dirty: true }; }
   let initialized = false, blocked = false, busy = false, timer;
   let lastUploadedContents = null, lastStatus;
+  let lastUploadedSlots = new Map();
   let fs, nativeSync, originalGetDB;
-  const status = message => {
-    if (message === lastStatus) return;
+  const status = (message, saveUploaded = false) => {
+    if (message === lastStatus && !saveUploaded) return;
     lastStatus = message;
-    parent.postMessage({ type: 'vnm-save-status', message }, location.origin);
+    parent.postMessage({ type: 'vnm-save-status', message, saveUploaded }, location.origin);
   };
+  const slots = copy => new Map(copy.files.filter(file => file.path.endsWith('.save'))
+    .map(file => [file.path, file.data]));
   // Ren'Py may flush repeatedly or touch mtimes without changing save bytes.
   // Exact comparisons avoid hash collisions and work on HTTP LAN deployments.
   const contents = copy => JSON.stringify(copy.files.map(({ path, data }) => ({ path, data }))
@@ -145,10 +148,14 @@
   }
   async function start() {
     const local = snapshot();
-    if (!meta.dirty) lastUploadedContents = contents(local);
+    if (!meta.dirty) {
+      lastUploadedContents = contents(local);
+      lastUploadedSlots = slots(local);
+    }
     try {
       const remote = await api('GET');
       lastUploadedContents = contents(remote.snapshot || { files: [] });
+      lastUploadedSlots = slots(remote.snapshot || { files: [] });
       if (remote.snapshot && local.files.length && (meta.dirty || meta.revision === 0)) {
         if (remote.revision !== meta.revision || meta.revision === 0) {
           const choice = await choose('Save conflict: this browser and server both have progress.', [
@@ -188,14 +195,19 @@
         meta.dirty = false; remember();
         return;
       }
+      // Confirm actual Ren'Py slot uploads separately from persistent-only writes.
+      // Only server-acknowledged additions/changes qualify; deletions do not.
+      const saveUploaded = copy.files.some(file => file.path.endsWith('.save') &&
+        lastUploadedSlots.get(file.path) !== file.data);
       // Fast background uploads should not flash the status on each interaction.
       syncingNotice = setTimeout(() => status('Syncing…'), 500);
       const result = await api('PUT', { revision: meta.revision, snapshot: copy });
       clearTimeout(syncingNotice);
       lastUploadedContents = copyContents;
+      lastUploadedSlots = slots(copy);
       meta.revision = result.revision;
       meta.dirty = contents(snapshot()) !== copyContents;
-      remember(); status(meta.dirty ? 'Syncing…' : 'Saves synced');
+      remember(); status(meta.dirty ? 'Syncing…' : 'Saves synced', saveUploaded);
     } catch (error) { status(blocked ? error.message : 'Offline — browser saves only'); }
     finally { clearTimeout(syncingNotice); busy = false; }
   }

@@ -24,6 +24,7 @@ export default function Player() {
   const { gameId } = useParams();
   const { user } = useAuth();
   const [saveStatus, setSaveStatus] = useState('Starting save sync…');
+  const [saveNoticeId, setSaveNoticeId] = useState(0);
   const {
     game,
     loading,
@@ -48,9 +49,13 @@ export default function Player() {
   const iframeRef = useRef(null);
   useEffect(() => {
     setSaveStatus('Starting save sync…');
+    setSaveNoticeId(0);
     const listener = event => {
       if (event.origin === window.location.origin && event.source === iframeRef.current?.contentWindow &&
-          event.data?.type === 'vnm-save-status' && typeof event.data.message === 'string') setSaveStatus(event.data.message);
+          event.data?.type === 'vnm-save-status' && typeof event.data.message === 'string') {
+        setSaveStatus(event.data.message);
+        if (event.data.saveUploaded === true) setSaveNoticeId(value => value + 1);
+      }
     };
     window.addEventListener('message', listener);
     const timeout = setTimeout(() => setSaveStatus(value => value === 'Starting save sync…' ? 'Save sync unavailable — browser saves only' : value), 30000);
@@ -369,7 +374,7 @@ export default function Player() {
               allow="autoplay; fullscreen"
               className="absolute inset-0 w-full h-full border-0"
             />
-            <SaveSyncToast key={gameId} message={saveStatus} />
+            <SaveSyncToast key={gameId} message={saveStatus} saveNoticeId={saveNoticeId} />
           </>
         ) : showIframe ? (
           /* Game is built & ready but the portrait overlay is still blocking.

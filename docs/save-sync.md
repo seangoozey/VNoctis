@@ -87,7 +87,10 @@ touches do not upload or increment the server revision. Persistent-only changes
 still synchronize even when no numbered save slot is created. The status remains
 steady for fast uploads; “Syncing…” appears if a transfer takes over half a second.
 The player notice disappears after four seconds and can be dismissed immediately.
-Routine background transfers do not bring it back. New offline/conflict/error
+Successful uploads containing newly written or changed Ren'Py `.save` slots
+(numbered, quick, or auto saves) briefly show “Save synced,” including consecutive
+saves with the same status text. Persistent-only updates, unchanged flushes, and
+slot deletions do not bring it back. New offline/conflict/error
 states briefly reveal it for eight seconds; recovery reveals it for four seconds.
 Requests time out after eight
 seconds; failure does not block gameplay or erase browser data. On reload, dirty

@@ -10,6 +10,7 @@ const settle = async () => { for (let i = 0; i < 20; i++) await new Promise(reso
 // Model the IDBFS populate/flush boundary rather than Ren'Py save semantics.
 function browser(server, databases, { user = 'A', game = 'X', metadata = new Map(), choices = [] } = {}) {
   const files = new Map(); const dirs = new Set([root]); const statuses = [];
+  const events = [];
   const backups = new Map();
   let interval, offline = false;
   const token = `header.${Buffer.from(JSON.stringify({ userId: user })).toString('base64url')}.signature`;
@@ -37,7 +38,7 @@ function browser(server, databases, { user = 'A', game = 'X', metadata = new Map
     URLSearchParams, Uint8Array, AbortSignal, console, setTimeout, clearTimeout,
     atob: s => Buffer.from(s, 'base64').toString('binary'), btoa: s => Buffer.from(s, 'binary').toString('base64'),
     localStorage: { getItem: key => metadata.get(key) ?? null, setItem: (key, value) => metadata.set(key, value) },
-    parent: { postMessage: data => statuses.push(data.message) },
+    parent: { postMessage: data => { statuses.push(data.message); events.push(data); } },
     Module: { FS: fs },
     IDBFS: { getDB: (name, callback) => {
       if (!databases.has(name)) databases.set(name, { files: new Map() });
@@ -87,7 +88,7 @@ function browser(server, databases, { user = 'A', game = 'X', metadata = new Map
   context.window = context;
   vm.createContext(context); vm.runInContext(source, context);
   return {
-    fs, statuses, metadata, namespace, backups,
+    fs, statuses, events, metadata, namespace, backups,
     offline: value => { offline = value; },
     async start() { context.Module.preInit.at(-1)(); await new Promise(resolve => fs.syncfs(true, resolve)); await settle(); },
     async flush() { await new Promise(resolve => fs.syncfs(false, resolve)); await settle(); },
@@ -192,4 +193,20 @@ test('frequent real changes are batched and persistent-only changes and deletion
   a.fs.unlink(`${root}/game/1.save`); await a.flush(); await a.retry();
   assert.equal(server.get('A:X').revision, 3);
   assert.equal(server.get('A:X').snapshot.files.length, 1);
+  assert.equal(a.events.filter(event => event.saveUploaded).length, 1);
+});
+
+test('each successful save-slot upload is acknowledged; offline failures are not', async () => {
+  const server = new Map(); const a = browser(server, new Map()); await a.start();
+  await a.save('first'); await a.save('second');
+  assert.equal(a.events.filter(event => event.saveUploaded).length, 2);
+  a.offline(true); await a.save('offline save');
+  assert.equal(a.events.filter(event => event.saveUploaded).length, 2);
+  a.offline(false); await a.retry();
+  assert.equal(a.events.filter(event => event.saveUploaded).length, 3);
+  for (const filename of ['auto-1.save', 'quick-1.save']) {
+    a.fs.writeFile(`${root}/game/${filename}`, Buffer.from(filename));
+    await a.flush(); await a.retry();
+  }
+  assert.equal(a.events.filter(event => event.saveUploaded).length, 5);
 });
