@@ -368,7 +368,7 @@ export default function Player() {
           <>
             <iframe
               ref={iframeRef}
-              src={`${game.webBuildPath}/index.html?vnmGame=${encodeURIComponent(gameId)}&vnmUser=${encodeURIComponent(user?.userId || '')}`}
+              src={`${game.webBuildPath}/index.html?vnmGame=${encodeURIComponent(gameId)}&vnmUser=${encodeURIComponent(user?.userId || '')}&vnmBridge=${__SAVE_SYNC_VERSION__}`}
               title={title}
               sandbox="allow-scripts allow-same-origin allow-popups allow-forms allow-downloads"
               allow="autoplay; fullscreen"

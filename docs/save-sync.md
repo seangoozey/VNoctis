@@ -120,8 +120,11 @@ If a game update changes its own `config.save_directory` or save compatibility,
 the old snapshot remains stored, but VNoctis cannot make the new game interpret it.
 
 Existing Ren'Py service workers match cached requests including their query
-strings. Player URLs include user/game parameters, so they do not reuse older
-unparameterized cached HTML. Avoid custom service workers that strip queries or
+strings. Player URLs include user/game parameters and the SHA-256 version of the
+bridge, so they do not reuse older game HTML after a bridge update. The UI image
+injects the same version into the bridge script URL, and the manager entry HTML
+requires cache revalidation to discover its latest hashed React assets.
+Avoid custom service workers that strip queries or
 serve HTML from another build. Original third-party games already execute with
 same-origin script access; storage namespaces are account isolation for normal
 operation, not a sandbox against malicious game JavaScript.
@@ -129,6 +132,11 @@ operation, not a sandbox against malicious game JavaScript.
 ## Validation
 
 Run `npm test` in each service and `npm run build` in `services/vnm-ui`.
+Run `npm run test:player` in the UI for the built React player plus bridge test
+in mobile-sized Chromium. It verifies that the startup toast disappears,
+persistent-only uploads stay quiet, consecutive save acknowledgements become
+visible, and notices can be dismissed. This uses a filesystem fixture, not a VN.
+Set `CHROME_PATH` to an existing Chrome executable or install Playwright Chromium.
 API tests apply all committed SQL migrations to a temporary SQLite database,
 then verify authentication gating, user/game isolation, stale and concurrent
 writers, traversal/payload limits, build-path changes, and cascading deletion.
