@@ -4,6 +4,7 @@ import useBuildStatus from '../hooks/useBuildStatus';
 import PlayerChrome from '../components/PlayerChrome';
 import BuildProgress from '../components/BuildProgress';
 import useAuth from '../hooks/useAuth';
+import SaveSyncToast from '../components/SaveSyncToast';
 
 /**
  * Full in-browser game player page at `/play/:gameId`.
@@ -368,7 +369,7 @@ export default function Player() {
               allow="autoplay; fullscreen"
               className="absolute inset-0 w-full h-full border-0"
             />
-            <div role="status" className="absolute bottom-3 left-3 z-10 bg-gray-900/90 text-white text-xs rounded px-3 py-2">{saveStatus}</div>
+            <SaveSyncToast key={gameId} message={saveStatus} />
           </>
         ) : showIframe ? (
           /* Game is built & ready but the portrait overlay is still blocking.

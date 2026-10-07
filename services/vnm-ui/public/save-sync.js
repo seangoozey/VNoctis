@@ -17,8 +17,17 @@
   try { meta = JSON.parse(localStorage.getItem(metaKey)) || { revision: 0, dirty: false }; }
   catch { meta = { revision: 0, dirty: true }; }
   let initialized = false, blocked = false, busy = false, timer;
+  let lastUploadedContents = null, lastStatus;
   let fs, nativeSync, originalGetDB;
-  const status = message => parent.postMessage({ type: 'vnm-save-status', message }, location.origin);
+  const status = message => {
+    if (message === lastStatus) return;
+    lastStatus = message;
+    parent.postMessage({ type: 'vnm-save-status', message }, location.origin);
+  };
+  // Ren'Py may flush repeatedly or touch mtimes without changing save bytes.
+  // Exact comparisons avoid hash collisions and work on HTTP LAN deployments.
+  const contents = copy => JSON.stringify(copy.files.map(({ path, data }) => ({ path, data }))
+    .sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
   const remember = () => localStorage.setItem(metaKey, JSON.stringify(meta));
   const api = async (method, body) => {
     // Never upload an old session's filesystem using a newly logged-in account.
@@ -136,8 +145,10 @@
   }
   async function start() {
     const local = snapshot();
+    if (!meta.dirty) lastUploadedContents = contents(local);
     try {
       const remote = await api('GET');
+      lastUploadedContents = contents(remote.snapshot || { files: [] });
       if (remote.snapshot && local.files.length && (meta.dirty || meta.revision === 0)) {
         if (remote.revision !== meta.revision || meta.revision === 0) {
           const choice = await choose('Save conflict: this browser and server both have progress.', [
@@ -159,7 +170,7 @@
       }
       // Existing isolated browser saves with no server record are safely imported.
       if (!remote.snapshot && snapshot().files.length) { meta.revision = 0; meta.dirty = true; remember(); }
-      status(meta.dirty ? 'Syncing…' : 'Saves synced');
+      if (!meta.dirty) status('Saves synced');
     } catch (error) {
       // Unknown server revision must never become permission to overwrite it later.
       // Restore failures also leave the previously loaded local files available.
@@ -170,15 +181,23 @@
   async function upload() {
     if (!initialized || blocked || busy || !meta.dirty) return;
     busy = true;
+    let syncingNotice;
     try {
-      const copy = snapshot(); const serialized = JSON.stringify(copy);
-      status('Syncing…');
+      const copy = snapshot(); const copyContents = contents(copy);
+      if (copyContents === lastUploadedContents) {
+        meta.dirty = false; remember();
+        return;
+      }
+      // Fast background uploads should not flash the status on each interaction.
+      syncingNotice = setTimeout(() => status('Syncing…'), 500);
       const result = await api('PUT', { revision: meta.revision, snapshot: copy });
+      clearTimeout(syncingNotice);
+      lastUploadedContents = copyContents;
       meta.revision = result.revision;
-      meta.dirty = JSON.stringify(snapshot()) !== serialized;
+      meta.dirty = contents(snapshot()) !== copyContents;
       remember(); status(meta.dirty ? 'Syncing…' : 'Saves synced');
     } catch (error) { status(blocked ? error.message : 'Offline — browser saves only'); }
-    finally { busy = false; }
+    finally { clearTimeout(syncingNotice); busy = false; }
   }
   window.Module = window.Module || {};
   const oldPreInit = Module.preInit;
@@ -200,7 +219,11 @@
             initialized = true; callback(null);
             timer = setInterval(upload, 5000); upload();
           });
-        } else { callback(null); if (!populate) upload(); }
+        } else {
+          // Keep browser writes immediate; coalesce server uploads on the five
+          // second interval instead of uploading on every filesystem flush.
+          callback(null);
+        }
       });
     };
   }];

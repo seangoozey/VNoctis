@@ -34,7 +34,7 @@ function browser(server, databases, { user = 'A', game = 'X', metadata = new Map
   };
   const context = {
     location: { search: `?vnmGame=${game}&vnmUser=${user}`, origin: 'https://vnm.test' },
-    URLSearchParams, Uint8Array, AbortSignal, console,
+    URLSearchParams, Uint8Array, AbortSignal, console, setTimeout, clearTimeout,
     atob: s => Buffer.from(s, 'base64').toString('binary'), btoa: s => Buffer.from(s, 'binary').toString('base64'),
     localStorage: { getItem: key => metadata.get(key) ?? null, setItem: (key, value) => metadata.set(key, value) },
     parent: { postMessage: data => statuses.push(data.message) },
@@ -90,7 +90,8 @@ function browser(server, databases, { user = 'A', game = 'X', metadata = new Map
     fs, statuses, metadata, namespace, backups,
     offline: value => { offline = value; },
     async start() { context.Module.preInit.at(-1)(); await new Promise(resolve => fs.syncfs(true, resolve)); await settle(); },
-    async save(data = 'progress') { fs.mkdirTree(`${root}/game`); fs.writeFile(`${root}/game/1.save`, Buffer.from(data)); await new Promise(resolve => fs.syncfs(false, resolve)); await settle(); },
+    async flush() { await new Promise(resolve => fs.syncfs(false, resolve)); await settle(); },
+    async save(data = 'progress') { fs.mkdirTree(`${root}/game`); fs.writeFile(`${root}/game/1.save`, Buffer.from(data)); await new Promise(resolve => fs.syncfs(false, resolve)); await settle(); await interval(); await settle(); },
     async retry() { await interval(); await settle(); },
   };
 }
@@ -161,4 +162,34 @@ test('startup conflict keeps offline progress unless server restoration is expli
   assert.equal(useServer.backups.size, 1);
   const copy = [...useServer.backups.values()][0];
   assert.equal(Buffer.from(copy.files[0].data, 'base64').toString(), 'offline progress');
+});
+
+test('unchanged filesystem flushes and timestamp-only touches do not upload or flash status', async () => {
+  const server = new Map(); const a = browser(server, new Map());
+  await a.start(); await a.save('saved progress');
+  const notices = [...a.statuses];
+  for (let i = 0; i < 30; i++) await a.flush();
+  await a.retry();
+  assert.equal(server.get('A:X').revision, 1);
+  assert.deepEqual(a.statuses, notices);
+  a.fs.utime(`${root}/game/1.save`, 9999, 9999);
+  await a.flush(); await a.retry();
+  assert.equal(server.get('A:X').revision, 1);
+  assert.deepEqual(a.statuses, notices);
+});
+
+test('frequent real changes are batched and persistent-only changes and deletions still sync', async () => {
+  const server = new Map(); const a = browser(server, new Map()); await a.start(); await a.save();
+  for (let i = 0; i < 30; i++) {
+    a.fs.writeFile(`${root}/game/persistent`, Buffer.from(`seen text ${i}`));
+    await a.flush();
+  }
+  assert.equal(server.get('A:X').revision, 1);
+  await a.retry();
+  assert.equal(server.get('A:X').revision, 2);
+  const persistent = server.get('A:X').snapshot.files.find(f => f.path.endsWith('/persistent'));
+  assert.equal(Buffer.from(persistent.data, 'base64').toString(), 'seen text 29');
+  a.fs.unlink(`${root}/game/1.save`); await a.flush(); await a.retry();
+  assert.equal(server.get('A:X').revision, 3);
+  assert.equal(server.get('A:X').snapshot.files.length, 1);
 });

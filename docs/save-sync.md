@@ -81,7 +81,15 @@ stays untouched. On shared browsers, import only saves you own. Selecting the
 wrong folder cannot be detected automatically.
 
 Offline edits keep their last acknowledged server revision and a dirty flag.
-Uploads retry every five seconds and on reconnect. Requests time out after eight
+Browser filesystem writes remain immediate. Server uploads are batched every
+five seconds and retried on reconnect. Unchanged file contents and timestamp-only
+touches do not upload or increment the server revision. Persistent-only changes
+still synchronize even when no numbered save slot is created. The status remains
+steady for fast uploads; “Syncing…” appears if a transfer takes over half a second.
+The player notice disappears after four seconds and can be dismissed immediately.
+Routine background transfers do not bring it back. New offline/conflict/error
+states briefly reveal it for eight seconds; recovery reveals it for four seconds.
+Requests time out after eight
 seconds; failure does not block gameplay or erase browser data. On reload, dirty
 local data is retained if the server revision still matches. If it differs,
 the startup prompt offers local play with sync paused or the server copy.

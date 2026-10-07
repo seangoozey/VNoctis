@@ -50,7 +50,10 @@ const server = http.createServer(async (req,res) => {
     await page.waitForFunction(()=>messages.some(m=>m.message==='Saves synced'));
     const frame=page.frames()[1];
     await frame.evaluate(async()=>{FS.mkdirTree('/home/web_user/.renpy/game');FS.writeFile('/home/web_user/.renpy/game/1.save',new Uint8Array([1,2,3]));await new Promise((r,j)=>FS.syncfs(false,e=>e?j(e):r()));});
-    await page.waitForFunction(()=>messages.filter(m=>m.message==='Saves synced').length>=2);
+    // Fast uploads deliberately keep the synced status steady.
+    const deadline=Date.now()+15000;
+    while (!states.get('A:X') && Date.now()<deadline) await new Promise(resolve=>setTimeout(resolve,100));
+    assert.ok(states.get('A:X'),'save must upload within fifteen seconds');
     assert.equal(states.get('A:X').snapshot.files[0].data,'AQID');
     const ctx2=await browser.newContext(); const page2=await ctx2.newPage(); page2.on('pageerror',e=>pageErrors.push(e.message)); await page2.goto(`${base}/parent`);
     await page2.waitForFunction(()=>messages.some(m=>m.message==='Saves synced'));
