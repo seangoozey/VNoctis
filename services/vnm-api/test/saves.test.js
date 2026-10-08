@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import Fastify from 'fastify';
 import { PrismaClient } from '@prisma/client';
 import savesRoutes, { validateSnapshot } from '../src/routes/saves.js';
+import { readCurrent } from '../src/services/saveHistory.js';
 
 const snapshot = (data = 'device A') => ({ version: 1, files: [
   { path: 'test/1-1-LT1.save', mtime: 1000, data: Buffer.from(data).toString('base64') },
@@ -127,7 +128,7 @@ test('SQLite migration and authenticated per-user/game revision API', async t =>
       assert.equal(list.items.length, 1); assert.equal(list.items[0].gameTitle, 'X');
       assert.equal(list.items[0].username, 'A'); assert.equal('payload' in list.items[0], false);
       const stored = await prisma.saveSyncState.findUnique({ where: { userId_gameId: { userId: 'A', gameId: 'X' } } });
-      assert.deepEqual((await admin('GET', '/A/X')).json().snapshot, JSON.parse(stored.payload));
+      assert.deepEqual((await admin('GET', '/A/X')).json().snapshot, await readCurrent(prisma, stored));
       assert.equal((await admin('DELETE', '/A/X', { revision: 1 })).statusCode, 409);
       await prisma.$executeRawUnsafe('INSERT INTO Game (id,directoryPath,directoryName,extractedTitle,updatedAt) VALUES (?,?,?,?,?)', 'X', '/games/X', 'X', 'X', new Date());
       assert.equal((await get('A')).json().revision, 2);

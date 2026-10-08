@@ -62,8 +62,13 @@ data is opaque base64. Directories are reconstructed. Empty directories are not
 required for save validity. Deletions are represented by absence from the next
 complete snapshot.
 
-`SaveSyncState` stores a bounded JSON manifest and SHA-256 checksum in SQLite.
-This uses the existing SQLite backup/migration path. Each upload still sends the
+`SaveSyncState` stores a compact file-hash manifest and SHA-256 checksum in SQLite.
+`SaveCurrentFile` references the same content-addressed `SaveFileBlob` rows as
+history, including current-only preference changes. Live updates therefore write
+new file bytes and small references rather than rewriting every unchanged slot.
+Legacy inline snapshots remain readable and convert atomically on their next
+upload or restore. Cleanup protects blobs referenced by either history or live
+state. This uses the existing SQLite backup/migration path. Each upload still sends the
 full save tree. Limits are 32 MiB decoded bytes, 4096 files,
 512-character relative paths, and a 46 MiB HTTP body. Files are never unpickled,
 unzipped, or written to server filesystem paths.
@@ -152,8 +157,9 @@ across renamed/rotated slots. Uploads check existing blob hashes before insertin
 bytes, so unchanged files are not passed back to the database. Retention scans
 for unused blobs only when versions are removed, plus the periodic sweep.
 Removing versions garbage-collects only blobs with
-no remaining references. Each manifest is immutable; the live snapshot remains
-separate. Existing synced data is archived lazily on first access/replacement.
+no remaining history or live references. Each history manifest is immutable;
+the live manifest remains separate. Existing synced data is archived lazily on
+first access/replacement.
 History cannot recover saves overwritten before deployment.
 
 Retention is applied on writes/history access and by hourly maintenance:

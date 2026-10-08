@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { archive, canonical, collectBlobs, digest, ensureCurrentVersion, prune, pruneAll, readVersion, saveChecksum, saveKind, writeTransaction } from '../services/saveHistory.js';
+import { archive, canonical, collectBlobs, digest, ensureCurrentVersion, prepareFiles, prune, pruneAll, readCurrent, readVersion, saveChecksum, saveKind, writeCurrent, writeTransaction } from '../services/saveHistory.js';
 
 export const MAX_SNAPSHOT_BYTES = 32 * 1024 * 1024;
 
@@ -61,17 +61,19 @@ export default async function savesRoutes(fastify) {
     },
   };
   fastify.get('/games/:gameId/saves', options, async request => {
-    const state = await fastify.prisma.saveSyncState.findUnique({ where: {
-      userId_gameId: { userId: request.user.userId, gameId: request.params.gameId },
-    } });
-    const key = { userId: request.user.userId, gameId: request.params.gameId };
-    const acknowledgement = request.query.uploadId ? await fastify.prisma.saveUploadReceipt.findUnique({ where: {
-      userId_gameId_uploadId: { ...key, uploadId: request.query.uploadId },
-    } }) : null;
-    const snapshot = state ? JSON.parse(state.payload) : null;
-    return { revision: state?.revision || 0, checksum: state?.checksum, uploadId: state?.uploadId,
-      currentVersionId: state?.currentVersionId, snapshot, saveChecksum: saveChecksum(snapshot || { files: [] }),
-      acknowledgement: acknowledgement ? receiptResponse(acknowledgement, state?.revision || 0) : null };
+    return writeTransaction(fastify.prisma, async tx => {
+      const state = await tx.saveSyncState.findUnique({ where: {
+        userId_gameId: { userId: request.user.userId, gameId: request.params.gameId },
+      } });
+      const key = { userId: request.user.userId, gameId: request.params.gameId };
+      const acknowledgement = request.query.uploadId ? await tx.saveUploadReceipt.findUnique({ where: {
+        userId_gameId_uploadId: { ...key, uploadId: request.query.uploadId },
+      } }) : null;
+      const snapshot = state ? await readCurrent(tx, state) : null;
+      return { revision: state?.revision || 0, checksum: state?.checksum, uploadId: state?.uploadId,
+        currentVersionId: state?.currentVersionId, snapshot, saveChecksum: saveChecksum(snapshot || { files: [] }),
+        acknowledgement: acknowledgement ? receiptResponse(acknowledgement, state?.revision || 0) : null };
+    });
   });
   fastify.put('/games/:gameId/saves', options, async (request, reply) => {
     const timings = {};
@@ -96,6 +98,8 @@ export default async function savesRoutes(fastify) {
     const checksum = createHash('sha256').update(payload).digest('hex');
     const key = { userId: request.user.userId, gameId: request.params.gameId };
     const id = uploadId || digest(`${revision}:${payload}`);
+    const prepared = prepareFiles(copy);
+    const incomingSlots = saveChecksum(copy);
     mark('validateAndHashMs');
     const result = await writeTransaction(fastify.prisma, async tx => {
       mark('queueAndBeginMs');
@@ -104,17 +108,22 @@ export default async function savesRoutes(fastify) {
       mark('readStateMs');
       if (receipt) return receipt.checksum === checksum ? receiptResponse(receipt, state?.revision || 0)
         : { error: 'Upload ID already used for different save data.' };
-      const previous = state ? canonical(JSON.parse(state.payload)) : { version: 1, files: [] };
+      const stored = state ? JSON.parse(state.payload) : { version: 1, files: [] };
+      // Compact manifests let us compare slots without reading tens of MB of
+      // unchanged file bytes back out of SQLite on every upload.
+      const previous = stored.storage === 'blobs'
+        ? { files: stored.files.map(file => ({ path: file.path, data: file.hash })) } : canonical(stored);
       // Import an old acknowledged request when upgrading from the earlier bridge.
-      if (state?.uploadId === id && digest(JSON.stringify(previous)) === checksum) {
+      if (state?.uploadId === id && (stored.storage === 'blobs' ? state.checksum : digest(JSON.stringify(previous))) === checksum) {
         const imported = await tx.saveUploadReceipt.create({ data: { ...key, uploadId: id, checksum,
-          revision: state.revision, disposition: 'current', saveChecksum: saveChecksum(copy) } });
+          revision: state.revision, disposition: 'current', saveChecksum: incomingSlots } });
         return receiptResponse(imported, state.revision);
       }
-      const incomingSlots = saveChecksum(copy), serverSlots = saveChecksum(previous);
+      const serverSlots = stored.storage === 'blobs' ? stored.saveChecksum : saveChecksum(previous);
       const divergent = Boolean(state && (alternate || (revision !== state.revision &&
         baseSaveChecksum !== serverSlots && incomingSlots !== serverSlots)));
-      const kind = saveKind(previous, copy);
+      const kind = saveKind(previous, stored.storage === 'blobs'
+        ? { files: prepared.map(file => ({ path: file.path, data: file.hash })) } : copy);
       mark('compareMs');
       // Existing saves are archived lazily before their first replacement.
       let currentVersionId = state?.currentVersionId || null;
@@ -126,13 +135,13 @@ export default async function savesRoutes(fastify) {
       if (kind || divergent || !state) {
         versionId = await archive(tx, copy, { ...key, gameTitle: request.saveGameTitle,
           kind: kind || 'checkpoint', alternate: Boolean(divergent), branchId: continuation, baseRevision: revision,
-          revision: nextRevision, deviceLabel });
+          revision: nextRevision, deviceLabel }, prepared);
       }
       mark('archiveMs');
       if (!divergent) {
         if (versionId) currentVersionId = versionId;
         const data = { payload, checksum, uploadId: id, gameTitle: request.saveGameTitle, revision: nextRevision, currentVersionId };
-        await tx.saveSyncState.upsert({ where: { userId_gameId: key }, create: { ...key, ...data }, update: data });
+        await writeCurrent(tx, key, copy, data, prepared);
       }
       mark('writeCurrentMs');
       const accepted = await tx.saveUploadReceipt.create({ data: { ...key, uploadId: id, checksum,
@@ -201,7 +210,7 @@ export default async function savesRoutes(fastify) {
       const payload = JSON.stringify(canonical(selected.snapshot));
       const data = { payload, checksum: digest(payload), revision, uploadId: id,
         currentVersionId: versionId, gameTitle: request.saveGameTitle };
-      await tx.saveSyncState.upsert({ where: { userId_gameId: key }, create: { ...key, ...data }, update: data });
+      await writeCurrent(tx, key, selected.snapshot, data);
       if (selected.version.alternate) await tx.saveVersion.updateMany({ where: { ...key,
         ...(selected.version.branchId ? { branchId: selected.version.branchId } : { id: selected.version.id }),
       }, data: { alternate: false } });
@@ -239,7 +248,8 @@ export default async function savesRoutes(fastify) {
   }, async request => {
     const rows = await fastify.prisma.$queryRaw`
       SELECT s.userId, s.gameId, s.gameTitle, s.revision, s.updatedAt, u.username,
-             length(s.payload) AS storedBytes
+             CASE WHEN json_extract(s.payload, '$.storage') = 'blobs'
+               THEN json_extract(s.payload, '$.byteSize') ELSE length(s.payload) END AS storedBytes
       FROM SaveSyncState s JOIN User u ON u.id = s.userId
       WHERE NOT EXISTS (SELECT 1 FROM Game g WHERE g.id = s.gameId)
       ORDER BY s.updatedAt DESC, s.userId, s.gameId LIMIT 51 OFFSET ${request.query.offset}`;
@@ -251,14 +261,16 @@ export default async function savesRoutes(fastify) {
     gameId: options.schema.params.properties.gameId,
   } } } };
   fastify.get('/admin/orphaned-saves/:userId/:gameId', orphanOptions, async (request, reply) => {
-    const { userId, gameId } = request.params;
-    const rows = await fastify.prisma.$queryRaw`
-      SELECT s.* FROM SaveSyncState s WHERE s.userId = ${userId} AND s.gameId = ${gameId}
-      AND NOT EXISTS (SELECT 1 FROM Game g WHERE g.id = s.gameId)`;
-    if (!rows.length) return reply.code(404).send({ message: 'Orphaned saves not found. The game may have returned.' });
-    const state = rows[0];
-    return { version: 1, userId, gameId, gameTitle: state.gameTitle, revision: state.revision,
-      snapshot: JSON.parse(state.payload) };
+    return writeTransaction(fastify.prisma, async tx => {
+      const { userId, gameId } = request.params;
+      const rows = await tx.$queryRaw`
+        SELECT s.* FROM SaveSyncState s WHERE s.userId = ${userId} AND s.gameId = ${gameId}
+        AND NOT EXISTS (SELECT 1 FROM Game g WHERE g.id = s.gameId)`;
+      if (!rows.length) return reply.code(404).send({ message: 'Orphaned saves not found. The game may have returned.' });
+      const state = rows[0];
+      return { version: 1, userId, gameId, gameTitle: state.gameTitle, revision: state.revision,
+        snapshot: await readCurrent(tx, state) };
+    });
   });
   fastify.delete('/admin/orphaned-saves/:userId/:gameId', {
     ...orphanOptions, schema: { ...orphanOptions.schema, body: { type: 'object', required: ['revision'], properties: {

@@ -60,10 +60,11 @@ model SaveSyncState {
   uploadId  String?
   currentVersionId String?
   revision  Int      @default(1)
-  payload   String   // Versioned file manifest; file bytes are opaque base64.
+  payload   String   // Compact live manifest, or legacy inline base64 snapshot.
   checksum  String
   updatedAt DateTime @updatedAt
   user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  files     SaveCurrentFile[]
 
   @@id([userId, gameId])
 }
@@ -75,6 +76,20 @@ model SaveFileBlob {
   data     Bytes
   size     Int
   files    SaveVersionFile[]
+  currentFiles SaveCurrentFile[]
+}
+
+model SaveCurrentFile {
+  userId String
+  gameId String
+  path   String
+  mtime  Float
+  hash   String
+  state  SaveSyncState @relation(fields: [userId, gameId], references: [userId, gameId], onDelete: Cascade)
+  blob   SaveFileBlob @relation(fields: [hash], references: [hash])
+
+  @@id([userId, gameId, path])
+  @@index([hash])
 }
 
 model SaveVersion {

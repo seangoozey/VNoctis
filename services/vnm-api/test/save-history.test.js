@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import Fastify from 'fastify';
 import { PrismaClient } from '@prisma/client';
 import savesRoutes from '../src/routes/saves.js';
-import { archive, digest, prune, retainedIds, saveChecksum } from '../src/services/saveHistory.js';
+import { archive, canonical, collectBlobs, digest, prune, retainedIds, saveChecksum, writeTransaction } from '../src/services/saveHistory.js';
 
 const encoded = value => Buffer.from(value).toString('base64');
 test('history uploads only new blob bytes and skips garbage collection when nothing expires', async () => {
@@ -107,6 +107,11 @@ test('deduplicated server history restores rotating RenPy slots without adding f
       assert.equal((await call('PUT', '', { revision: 90, snapshot: copy, uploadId: 'preferences' })).json().revision, 91);
       await call('GET', '/history');
       assert.equal(await prisma.saveVersion.count(), 90);
+      await writeTransaction(prisma, collectBlobs);
+      assert.deepEqual((await call('GET')).json().snapshot, canonical(copy), 'Current-only preferences survive garbage collection');
+      const state = await prisma.saveSyncState.findUnique({ where: { userId_gameId: { userId: 'A', gameId: 'X' } } });
+      assert.equal(JSON.parse(state.payload).storage, 'blobs');
+      assert.equal(await prisma.saveCurrentFile.count({ where: { userId: 'A', gameId: 'X' } }), copy.files.length);
       assert.equal((await call('GET', '/history', undefined, 'B')).json().versions.length, 0);
       for (const [method, path, body] of [['GET', `/history/${firstId}`], ['POST', `/history/${firstId}/restore`, { revision: 0, uploadId: 'attack' }], ['DELETE', `/history/${firstId}`]]) {
         assert.equal((await call(method, path, body, 'B')).statusCode, 404);
@@ -155,6 +160,27 @@ test('deduplicated server history restores rotating RenPy slots without adding f
       assert.ok(await prisma.saveVersionFile.count({ where: { hash: { in: (await prisma.saveFileBlob.findMany({ select: { hash: true } })).map(blob => blob.hash) } } }) > 0);
       assert.equal((await put(0, 5000, 'unique-alternate')).json().versionId, id);
       assert.equal((await call('GET', `/history/${id}`)).statusCode, 404);
+    });
+    await t.test('large legacy snapshots convert to compact live references and reuse unchanged bytes', async () => {
+      const large = Buffer.alloc(2 * 1024 * 1024, 42);
+      const initial = { version: 1, files: [
+        { path: 'game/1.save', mtime: 1000, data: large.toString('base64') },
+        { path: 'game/2.save', mtime: 1000, data: encoded('old slot') },
+      ] };
+      const key = { userId: 'A', gameId: 'Y' };
+      const payload = JSON.stringify(canonical(initial));
+      await prisma.saveSyncState.create({ data: { ...key, gameTitle: 'Y', revision: 4, payload, checksum: digest(payload) } });
+      assert.deepEqual((await call('GET', '', undefined, 'A', 'Y')).json().snapshot, canonical(initial));
+      const next = structuredClone(initial); next.files[1].data = encoded('new slot');
+      const result = await call('PUT', '', { revision: 4, snapshot: next, uploadId: 'compact-large' }, 'A', 'Y');
+      assert.equal(result.statusCode, 200, result.body);
+      const state = await prisma.saveSyncState.findUnique({ where: { userId_gameId: key } });
+      assert.ok(state.payload.length < 1024, 'Live row contains references rather than MB of unchanged save bytes');
+      assert.deepEqual((await call('GET', '', undefined, 'A', 'Y')).json().snapshot, canonical(next));
+      assert.equal(await prisma.saveFileBlob.count({ where: { hash: digest(large) } }), 1);
+      assert.equal(await prisma.saveCurrentFile.count({ where: key }), 2);
+      const oldVersion = await prisma.saveVersion.findFirst({ where: { ...key, revision: 4 } });
+      assert.deepEqual((await call('GET', `/history/${oldVersion.id}`, undefined, 'A', 'Y')).json().snapshot, canonical(initial));
     });
   } finally {
     await app.close(); await prisma.$disconnect(); rmSync(directory, { recursive: true, force: true });
