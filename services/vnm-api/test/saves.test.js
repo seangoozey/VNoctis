@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import Fastify from 'fastify';
 import { PrismaClient } from '@prisma/client';
-import savesRoutes, { validateSnapshot } from '../src/routes/saves.js';
+import savesRoutes, { validateDelta, validateSnapshot } from '../src/routes/saves.js';
 import { readCurrent } from '../src/services/saveHistory.js';
 
 const snapshot = (data = 'device A') => ({ version: 1, files: [
@@ -28,6 +28,15 @@ test('snapshot rejects traversal, ambiguous trees, malformed bytes and invalid t
   assert.equal(validateSnapshot(bad), false);
   bad.files[0] = { path: 'test/save', data: '', mtime: -1 };
   assert.equal(validateSnapshot(bad), false);
+});
+
+test('delta validation rejects unsafe, duplicate, overlapping, and malformed paths', () => {
+  const delta = { version: 1, files: snapshot().files, deleted: ['old.save'] };
+  assert.equal(validateDelta(delta), true);
+  for (const deleted of [['../old.save'], ['old.save', 'old.save'], [delta.files[0].path], [12]]) {
+    assert.equal(validateDelta({ ...delta, deleted }), false);
+  }
+  assert.equal(validateDelta({ ...delta, files: [{ path: 'new.save', mtime: 1, data: '*' }] }), false);
 });
 
 test('large legitimate base64 files validate without regex stack exhaustion', () => {

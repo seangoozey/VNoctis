@@ -14,10 +14,11 @@ const saveHash = copy => createHash('sha256').update(JSON.stringify((copy?.files
 // Model the IDBFS populate/flush boundary rather than Ren'Py save semantics.
 function browser(server, databases, { user = 'A', game = 'X', metadata = new Map(), choices = [] } = {}) {
   server.receipts ||= new Map(); server.alternates ||= [];
+  server.uploads ||= [];
   const files = new Map(); const dirs = new Set([root]); const statuses = [];
   const events = [];
   const backups = new Map();
-  let interval, offline = false;
+  let interval, offline = false, encodings = 0;
   let nextUploadGate;
   let loseResponse = false;
   const listeners = new Map(); const documentListeners = new Map();
@@ -47,7 +48,7 @@ function browser(server, databases, { user = 'A', game = 'X', metadata = new Map
   const context = {
     location: { search: `?vnmGame=${game}&vnmUser=${user}`, origin: 'https://vnm.test' },
     URLSearchParams, Uint8Array, AbortSignal, console, setTimeout, clearTimeout,
-    atob: s => Buffer.from(s, 'base64').toString('binary'), btoa: s => Buffer.from(s, 'binary').toString('base64'),
+    atob: s => Buffer.from(s, 'base64').toString('binary'), btoa: s => { encodings++; return Buffer.from(s, 'binary').toString('base64'); },
     localStorage: { getItem: key => metadata.get(key) ?? null, setItem: (key, value) => metadata.set(key, value) },
     parent: { postMessage: data => { statuses.push(data.message); events.push(data); } },
     Module: { FS: fs },
@@ -101,14 +102,24 @@ function browser(server, databases, { user = 'A', game = 'X', metadata = new Map
       const state = server.get(key) || { revision: 0, snapshot: null };
       if (options.method === 'GET') {
         const id = new URLSearchParams(url.split('?')[1] || '').get('uploadId');
-        return { ok: true, status: 200, json: async () => ({ ...state, saveChecksum: saveHash(state.snapshot),
+        return { ok: true, status: 200, json: async () => ({ ...state, deltaUploads: server.deltaUploads !== false, saveChecksum: saveHash(state.snapshot),
           acknowledgement: server.receipts.get(`${key}:${id}`)?.response || null }) };
       }
       const body = JSON.parse(options.body);
+      server.uploads.push(structuredClone(body));
+      const identity = JSON.stringify(body.delta || body.snapshot);
       const receiptKey = `${key}:${body.uploadId}`, receipt = server.receipts.get(receiptKey);
       if (receipt) {
-        if (receipt.payload !== JSON.stringify(body.snapshot)) return { ok: false, status: 409 };
+        if (receipt.payload !== identity) return { ok: false, status: 409, json: async () => ({}) };
         return { ok: true, status: 200, json: async () => receipt.response };
+      }
+      if (body.delta) {
+        if (body.alternate || body.revision !== state.revision) return { ok: false, status: 409,
+          json: async () => ({ code: 'SAVE_BASE_CHANGED', message: 'Server changed' }) };
+        const files = new Map((state.snapshot?.files || []).map(file => [file.path, file]));
+        for (const path of body.delta.deleted) files.delete(path);
+        for (const file of body.delta.files) files.set(file.path, file);
+        body.snapshot = { version: 1, files: [...files.values()] };
       }
       const alternate = state.snapshot && (body.alternate || (state.revision !== body.revision &&
         body.baseSaveChecksum !== saveHash(state.snapshot) && saveHash(body.snapshot) !== saveHash(state.snapshot)));
@@ -117,7 +128,7 @@ function browser(server, databases, { user = 'A', game = 'X', metadata = new Map
       if (alternate) server.alternates.push({ key, branchId, snapshot: body.snapshot });
       else server.set(key, next);
       const response = { revision: next.revision, disposition: alternate ? 'alternate' : 'current', branchId, saveChecksum: saveHash(body.snapshot) };
-      server.receipts.set(receiptKey, { payload: JSON.stringify(body.snapshot), response });
+      server.receipts.set(receiptKey, { payload: identity, response });
       if (loseResponse) { loseResponse = false; throw new Error('response lost after commit'); }
       const gate = nextUploadGate; nextUploadGate = null;
       if (gate) await gate;
@@ -131,6 +142,7 @@ function browser(server, databases, { user = 'A', game = 'X', metadata = new Map
   vm.createContext(context); vm.runInContext(source, context);
   return {
     fs, statuses, events, metadata, namespace, backups,
+    encodedCount: () => encodings,
     offline: value => { offline = value; },
     pauseNextUpload() { let release; nextUploadGate = new Promise(resolve => { release = resolve; }); return release; },
     loseNextResponse() { loseResponse = true; },
@@ -290,6 +302,60 @@ test('completed slot writes persist and upload without an engine flush or retry 
   await new Promise(resolve => setTimeout(resolve, 20)); await settle();
   assert.equal(server.get('A:X').revision, 2);
   assert.equal(a.events.filter(event => event.saveUploaded).length, 2);
+});
+
+test('changed-file uploads omit untouched slots, include deletions, and fall back safely on a stale baseline', async () => {
+  const server = new Map(), a = browser(server, new Map()); await a.start();
+  a.fs.mkdirTree(`${root}/game`);
+  a.fs.writeFile(`${root}/game/2.save`, Buffer.alloc(1024 * 1024, 42)); await a.save('first');
+  await a.save('second');
+  const patch = server.uploads.at(-1);
+  assert.equal(patch.snapshot, undefined);
+  assert.equal(patch.delta.files.length, 1);
+  assert.equal(patch.delta.files[0].path, 'game/1.save');
+  assert.ok(JSON.stringify(patch).length < 1024, 'Unchanged large slot does not cross the network');
+  a.fs.unlink(`${root}/game/2.save`); await a.flush(); await a.retry();
+  assert.deepEqual(server.uploads.at(-1).delta.deleted, ['game/2.save']);
+  assert.equal(server.get('A:X').snapshot.files.length, 1);
+  const other = browser(server, new Map()); await other.start(); await other.save('another device');
+  await a.save('independent progress');
+  const attempts = server.uploads.slice(-2);
+  assert.ok(attempts[0].delta); assert.ok(attempts[1].snapshot);
+  assert.equal(attempts[0].uploadId, attempts[1].uploadId);
+  assert.equal(server.alternates.at(-1).snapshot.files[0].data, Buffer.from('independent progress').toString('base64'));
+  assert.equal(server.get('A:X').snapshot.files[0].data, Buffer.from('another device').toString('base64'));
+});
+
+test('encoding cache skips unchanged bytes but detects same-size edits with unchanged timestamps', async () => {
+  const server = new Map(), a = browser(server, new Map()); await a.start(); await a.save('abc');
+  const count = a.encodedCount();
+  a.fs.utime(`${root}/game/1.save`, 9999, 9999); await a.flush(); await a.retry();
+  assert.equal(a.encodedCount(), count);
+  a.fs.writeFile(`${root}/game/1.save`, Buffer.from('def'));
+  a.fs.utime(`${root}/game/1.save`, 9999, 9999); await a.flush();
+  assert.equal(a.encodedCount(), count + 1);
+  assert.equal(Buffer.from(server.get('A:X').snapshot.files[0].data, 'base64').toString(), 'def');
+});
+
+test('servers without delta capability keep receiving complete snapshots', async () => {
+  const server = new Map(); server.deltaUploads = false;
+  const a = browser(server, new Map()); await a.start(); await a.save('first'); await a.save('second');
+  assert.ok(server.uploads.every(upload => upload.snapshot && !upload.delta));
+});
+
+test('lost full-fallback acknowledgement survives reload without duplicating an alternate', async () => {
+  const server = new Map(), databases = new Map(), metadata = new Map();
+  const a = browser(server, databases, { metadata }); await a.start(); await a.save('baseline');
+  const other = browser(server, new Map()); await other.start(); await other.save('server progress');
+  a.loseNextResponse();
+  a.fs.writeFile(`${root}/game/1.save`, Buffer.from('independent progress')); await a.flush();
+  assert.equal(server.alternates.length, 1);
+  const stored = databases.get('vnm-save-outbox').files.get('uploads:vnm-saves:A:X');
+  assert.equal(stored.delta, undefined, 'Fallback mode is durable before sending');
+  assert.ok(stored.snapshot);
+  const reload = browser(server, databases, { metadata }); await reload.start();
+  assert.equal(server.alternates.length, 1);
+  assert.equal(Buffer.from(reload.fs.readFile(`${root}/game/1.save`)).toString(), 'server progress');
 });
 
 test('a slot saved during an upload follows immediately after its acknowledgement', async () => {

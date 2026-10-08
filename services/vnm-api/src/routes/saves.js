@@ -32,6 +32,14 @@ export function validateSnapshot(snapshot) {
   return true;
 }
 
+export function validateDelta(delta) {
+  if (!delta || !validateSnapshot({ version: delta.version, files: delta.files }) ||
+      !Array.isArray(delta.deleted) || delta.deleted.length > 4096) return false;
+  const changed = new Set(delta.files.map(file => file.path));
+  return delta.deleted.every(path => !changed.has(path)) && validateSnapshot({ version: 1,
+    files: delta.deleted.map(path => ({ path, mtime: 0, data: '' })) });
+}
+
 export default async function savesRoutes(fastify) {
   let retentionTimer, retentionTask = null;
   fastify.addHook('onReady', async () => {
@@ -71,6 +79,7 @@ export default async function savesRoutes(fastify) {
       } }) : null;
       const snapshot = state ? await readCurrent(tx, state) : null;
       return { revision: state?.revision || 0, checksum: state?.checksum, uploadId: state?.uploadId,
+        deltaUploads: true,
         currentVersionId: state?.currentVersionId, snapshot, saveChecksum: saveChecksum(snapshot || { files: [] }),
         acknowledgement: acknowledgement ? receiptResponse(acknowledgement, state?.revision || 0) : null };
     });
@@ -85,36 +94,58 @@ export default async function savesRoutes(fastify) {
       measuredAt = now;
     };
     mark('beforeHandlerMs');
-    const { revision, snapshot, uploadId = null, baseSaveChecksum = null, alternate = false, branchId = null, deviceLabel = 'Browser' } = request.body || {};
-    if (!Number.isSafeInteger(revision) || revision < 0 || revision >= 2147483647 || !validateSnapshot(snapshot) ||
+    const { revision, snapshot, delta, uploadId = null, baseSaveChecksum = null, alternate = false, branchId = null, deviceLabel = 'Browser' } = request.body || {};
+    const incremental = delta !== undefined;
+    if (!Number.isSafeInteger(revision) || revision < 0 || revision >= 2147483647 ||
+        (incremental ? snapshot !== undefined || !validateDelta(delta) || uploadId === null : !validateSnapshot(snapshot)) ||
         (uploadId !== null && (typeof uploadId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(uploadId))) ||
         (baseSaveChecksum !== null && (typeof baseSaveChecksum !== 'string' || !/^[a-f0-9]{64}$/.test(baseSaveChecksum))) ||
         (branchId !== null && (typeof branchId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(branchId))) ||
         typeof alternate !== 'boolean' || typeof deviceLabel !== 'string' || !deviceLabel || deviceLabel.length > 80 || /[\x00-\x1f]/.test(deviceLabel)) {
       return reply.code(400).send({ message: 'Invalid save snapshot' });
     }
-    const copy = canonical(snapshot);
-    const payload = JSON.stringify(copy);
-    const checksum = createHash('sha256').update(payload).digest('hex');
+    let copy = incremental ? null : canonical(snapshot);
+    let payload = incremental ? null : JSON.stringify(copy);
+    let checksum = incremental ? null : createHash('sha256').update(payload).digest('hex');
+    const deltaPayload = incremental ? JSON.stringify({ revision, delta: { ...canonical(delta), deleted: [...delta.deleted].sort() },
+      baseSaveChecksum, alternate, branchId, deviceLabel }) : null;
+    const requestChecksum = incremental ? digest(deltaPayload) : checksum;
     const key = { userId: request.user.userId, gameId: request.params.gameId };
     const id = uploadId || digest(`${revision}:${payload}`);
-    const prepared = prepareFiles(copy);
-    const incomingSlots = saveChecksum(copy);
+    let prepared = incremental ? null : prepareFiles(copy);
+    let incomingSlots = incremental ? null : saveChecksum(copy);
     mark('validateAndHashMs');
     const result = await writeTransaction(fastify.prisma, async tx => {
       mark('queueAndBeginMs');
       const state = await tx.saveSyncState.findUnique({ where: { userId_gameId: key } });
       const receipt = await tx.saveUploadReceipt.findUnique({ where: { userId_gameId_uploadId: { ...key, uploadId: id } } });
       mark('readStateMs');
-      if (receipt) return receipt.checksum === checksum ? receiptResponse(receipt, state?.revision || 0)
+      if (receipt) return receipt.checksum === requestChecksum ? receiptResponse(receipt, state?.revision || 0)
         : { error: 'Upload ID already used for different save data.' };
+      if (incremental) {
+        // A patch is meaningful only against the exact acknowledged revision.
+        // Reject before writing anything; the client retains its complete copy
+        // and can use the normal alternate-preservation path instead.
+        if (alternate || revision !== (state?.revision || 0)) return {
+          error: 'Server saves changed; retry with the complete snapshot.', code: 'SAVE_BASE_CHANGED',
+        };
+        const baseline = state ? await readCurrent(tx, state) : { version: 1, files: [] };
+        const files = new Map(baseline.files.map(file => [file.path, file]));
+        for (const path of delta.deleted) files.delete(path);
+        for (const file of delta.files) files.set(file.path, file);
+        copy = canonical({ version: 1, files: [...files.values()] });
+        if (!validateSnapshot(copy)) return { error: 'Invalid resulting save snapshot.', status: 400 };
+        payload = JSON.stringify(copy); checksum = digest(payload);
+        prepared = prepareFiles(copy); incomingSlots = saveChecksum(copy);
+        mark('expandDeltaMs');
+      }
       const stored = state ? JSON.parse(state.payload) : { version: 1, files: [] };
       // Compact manifests let us compare slots without reading tens of MB of
       // unchanged file bytes back out of SQLite on every upload.
       const previous = stored.storage === 'blobs'
         ? { files: stored.files.map(file => ({ path: file.path, data: file.hash })) } : canonical(stored);
       // Import an old acknowledged request when upgrading from the earlier bridge.
-      if (state?.uploadId === id && (stored.storage === 'blobs' ? state.checksum : digest(JSON.stringify(previous))) === checksum) {
+      if (!incremental && state?.uploadId === id && (stored.storage === 'blobs' ? state.checksum : digest(JSON.stringify(previous))) === checksum) {
         const imported = await tx.saveUploadReceipt.create({ data: { ...key, uploadId: id, checksum,
           revision: state.revision, disposition: 'current', saveChecksum: incomingSlots } });
         return receiptResponse(imported, state.revision);
@@ -144,7 +175,7 @@ export default async function savesRoutes(fastify) {
         await writeCurrent(tx, key, copy, data, prepared);
       }
       mark('writeCurrentMs');
-      const accepted = await tx.saveUploadReceipt.create({ data: { ...key, uploadId: id, checksum,
+      const accepted = await tx.saveUploadReceipt.create({ data: { ...key, uploadId: id, checksum: requestChecksum,
         revision: nextRevision, disposition: divergent ? 'alternate' : 'current', versionId, branchId: continuation,
         saveChecksum: incomingSlots } });
       mark('receiptMs');
@@ -155,9 +186,10 @@ export default async function savesRoutes(fastify) {
     mark('commitMs');
     const totalMs = Math.round((performance.now() - startedAt) * 10) / 10;
     if (totalMs >= 500) request.log.info({ saveTiming: { totalMs, ...timings,
-      files: copy.files.length, snapshotBytes: Buffer.byteLength(payload),
+      files: copy?.files.length, snapshotBytes: payload ? Buffer.byteLength(payload) : 0,
+      incremental, uploadBytes: incremental ? Buffer.byteLength(deltaPayload) : Buffer.byteLength(payload),
     } }, 'Slow save upload');
-    return result.error ? reply.code(409).send({ message: result.error }) : result;
+    return result.error ? reply.code(result.status || 409).send({ message: result.error, code: result.code }) : result;
   });
 
   const historyOptions = { ...options, schema: { ...options.schema, querystring: { type: 'object', properties: {

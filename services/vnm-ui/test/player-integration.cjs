@@ -70,9 +70,16 @@ const server = createServer(async (request, response) => {
     return json({ version: 1, gameId: 'X', snapshot: version.snapshot });
   }
   if (url.pathname === '/api/v1/games/X/saves') {
-    if (request.method === 'GET') return json({ ...state, saveChecksum: saveHash(state.snapshot), acknowledgement: receipts.get(url.searchParams.get('uploadId')) || null });
+    if (request.method === 'GET') return json({ ...state, deltaUploads: true, saveChecksum: saveHash(state.snapshot), acknowledgement: receipts.get(url.searchParams.get('uploadId')) || null });
     let body = ''; for await (const chunk of request) body += chunk;
     const upload = JSON.parse(body);
+    if (upload.delta) {
+      if (upload.revision !== state.revision) { response.statusCode = 409; return json({ code: 'SAVE_BASE_CHANGED' }); }
+      const files = new Map((state.snapshot?.files || []).map(file => [file.path, file]));
+      for (const path of upload.delta.deleted) files.delete(path);
+      for (const file of upload.delta.files) files.set(file.path, file);
+      upload.snapshot = { version: 1, files: [...files.values()] };
+    }
     if (upload.revision !== state.revision) { response.statusCode = 409; return json({}); }
     const changedSlots = saveHash(state.snapshot) !== saveHash(upload.snapshot);
     state = { revision: state.revision + 1, snapshot: upload.snapshot, uploadId: upload.uploadId,

@@ -182,6 +182,35 @@ test('deduplicated server history restores rotating RenPy slots without adding f
       const oldVersion = await prisma.saveVersion.findFirst({ where: { ...key, revision: 4 } });
       assert.deepEqual((await call('GET', `/history/${oldVersion.id}`, undefined, 'A', 'Y')).json().snapshot, canonical(initial));
     });
+    await t.test('delta updates retain complete history and idempotent receipts, reject stale bases, and validate the merged tree', async () => {
+      const initial = autoSnapshot(1);
+      const ownCall = (method, path, body) => call(method, path, body, 'B', 'Y');
+      assert.equal((await ownCall('PUT', '', { revision: 0, snapshot: initial, uploadId: 'delta-initial' })).statusCode, 200);
+      const changed = { ...initial.files[0], data: encoded('delta progress') };
+      const patch = { revision: 1, uploadId: 'delta-next', delta: { version: 1, files: [changed], deleted: ['game/auto-10-LT1.save'] } };
+      const accepted = await ownCall('PUT', '', patch);
+      assert.equal(accepted.statusCode, 200, accepted.body);
+      assert.equal(accepted.json().revision, 2);
+      const expected = canonical({ version: 1, files: initial.files.filter(f => f.path !== changed.path && !patch.delta.deleted.includes(f.path)).concat(changed) });
+      assert.deepEqual((await ownCall('GET', '')).json().snapshot, expected);
+      assert.deepEqual((await ownCall('GET', `/history/${accepted.json().versionId}`)).json().snapshot, expected);
+      const advance = structuredClone(expected); advance.files[0].data = encoded('newer device');
+      assert.equal((await ownCall('PUT', '', { revision: 2, snapshot: advance, uploadId: 'delta-advance' })).json().revision, 3);
+      assert.equal((await ownCall('DELETE', `/history/${accepted.json().versionId}`)).statusCode, 200);
+      assert.equal((await ownCall('PUT', '', patch)).json().revision, 2, 'Receipt survives later writes and history deletion');
+      assert.equal((await ownCall('GET', '')).json().revision, 3);
+      const stale = { ...patch, uploadId: 'delta-stale' };
+      const rejected = await ownCall('PUT', '', stale);
+      assert.equal(rejected.statusCode, 409); assert.equal(rejected.json().code, 'SAVE_BASE_CHANGED');
+      const fallback = await ownCall('PUT', '', { revision: 1, snapshot: expected, uploadId: stale.uploadId });
+      assert.equal(fallback.json().disposition, 'alternate');
+      assert.equal((await ownCall('GET', '')).json().revision, 3);
+      const invalid = await ownCall('PUT', '', { revision: 3, uploadId: 'delta-invalid',
+        delta: { version: 1, files: [{ path: 'game', mtime: 1, data: encoded('file replacing a directory') }], deleted: [] } });
+      assert.equal(invalid.statusCode, 400);
+      assert.equal((await ownCall('GET', '')).json().revision, 3);
+      assert.equal((await ownCall('PUT', '', { ...patch, delta: { ...patch.delta, files: [{ ...changed, data: encoded('reused ID') }] } })).statusCode, 409);
+    });
   } finally {
     await app.close(); await prisma.$disconnect(); rmSync(directory, { recursive: true, force: true });
   }

@@ -51,7 +51,8 @@ Sources: [official 8.5.2 web package](https://www.renpy.org/dl/8.5.2/renpy-8.5.2
 `GET /api/v1/games/:gameId/saves` returns the live revision, snapshot, slot
 checksum, and current history version ID. An absent record has revision zero and
 a null snapshot. `?uploadId=...` also returns that upload's durable receipt.
-Responses are not cacheable.
+Responses are not cacheable. `deltaUploads: true` advertises changed-file upload
+support; bridges using older APIs keep sending complete snapshots.
 
 `PUT /api/v1/games/:gameId/saves` accepts `{ revision, snapshot, uploadId,
 baseSaveChecksum, deviceLabel, alternate, branchId }`. It returns the accepted
@@ -62,14 +63,25 @@ data is opaque base64. Directories are reconstructed. Empty directories are not
 required for save validity. Deletions are represented by absence from the next
 complete snapshot.
 
+When its full baseline is known, the bridge sends `delta: { version: 1,
+files: [changed files], deleted: [relative paths] }` instead of `snapshot`.
+The API applies it atomically only at exactly the submitted revision, validates
+the complete resulting tree and size, and retains a complete history version.
+Stale revisions return `SAVE_BASE_CHANGED` before any write. The bridge durably
+switches that request to its retained full snapshot and retries through normal
+alternate-preservation logic. Successful delta receipts are checked before
+revision checks, so lost acknowledgements remain idempotent after later saves.
+
 `SaveSyncState` stores a compact file-hash manifest and SHA-256 checksum in SQLite.
 `SaveCurrentFile` references the same content-addressed `SaveFileBlob` rows as
 history, including current-only preference changes. Live updates therefore write
 new file bytes and small references rather than rewriting every unchanged slot.
 Legacy inline snapshots remain readable and convert atomically on their next
 upload or restore. Cleanup protects blobs referenced by either history or live
-state. This uses the existing SQLite backup/migration path. Each upload still sends the
-full save tree. Limits are 32 MiB decoded bytes, 4096 files,
+state. This uses the existing SQLite backup/migration path. Initial imports,
+unknown baselines, alternate continuations, and stale-delta fallbacks send the
+full save tree. Ordinary acknowledged updates send only changed files/deletions.
+Limits on the complete resulting tree are 32 MiB decoded bytes, 4096 files,
 512-character relative paths, and a 46 MiB HTTP body. Files are never unpickled,
 unzipped, or written to server filesystem paths.
 

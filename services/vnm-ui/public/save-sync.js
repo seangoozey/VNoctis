@@ -19,6 +19,8 @@
   let initialized = false, blocked = false, busy = false, timer;
   let lastUploadedContents = null, lastStatus;
   let lastUploadedSlots = new Map();
+  let lastUploadedFiles = null, deltaUploads = false;
+  const encodedFiles = new Map();
   let slotWritePending = false, urgentUploadPending = false;
   let pendingUpload = null;
   let acknowledgedSlots = null;
@@ -37,12 +39,16 @@
   }
   // Ren'Py may flush repeatedly or touch mtimes without changing save bytes.
   // Exact comparisons avoid hash collisions and work on HTTP LAN deployments.
-  const contents = copy => JSON.stringify(copy.files.map(({ path, data }) => ({ path, data }))
-    .sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  const contents = copy => new Map(copy.files.map(file => [file.path, file.data]));
+  const sameContents = (a, b) => a?.size === b?.size && [...a].every(([path, data]) => b.get(path) === data);
   const remember = () => localStorage.setItem(metaKey, JSON.stringify(meta));
   const deviceLabel = /Mobi|Android|iPad/i.test(window.navigator?.userAgent || '') ? 'Mobile browser' : 'Desktop browser';
   const requestFor = copy => ({ uploadId: window.crypto?.randomUUID?.() || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`,
     revision: meta.revision, snapshot: copy, baseSaveChecksum: meta.baseSaveChecksum || null,
+    ...(deltaUploads && lastUploadedFiles && !meta.alternate ? { delta: { version: 1,
+      files: copy.files.filter(file => lastUploadedFiles.get(file.path) !== file.data),
+      deleted: [...lastUploadedFiles.keys()].filter(path => !copy.files.some(file => file.path === path)),
+    } } : {}),
     alternate: Boolean(meta.alternate), branchId: meta.branchId || null, deviceLabel });
   const api = async (method, body, query = '') => {
     // Never upload an old session's filesystem using a newly logged-in account.
@@ -52,10 +58,27 @@
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
       ...(body ? { body: JSON.stringify(body) } : {}),
     });
-    if (response.status === 409) { blocked = true; throw new Error('Save upload could not be verified — device saves retained'); }
+    if (response.status === 409) {
+      const details = await response.json();
+      if (details.code === 'SAVE_BASE_CHANGED') throw Object.assign(new Error(details.message), { code: details.code });
+      blocked = true; throw new Error('Save upload could not be verified — device saves retained');
+    }
     if (!response.ok) throw new Error(`Save service unavailable (${response.status})`);
     return response.json();
   };
+  async function sendUpload(request) {
+    const { snapshot: full, delta, ...metadata } = request;
+    if (delta) {
+      try { return await api('PUT', { ...metadata, delta }); }
+      catch (error) {
+        if (error.code !== 'SAVE_BASE_CHANGED') throw error;
+        // Persist the fallback before sending it, so a lost full-upload response
+        // or reload retries exactly the same request and upload ID.
+        delete request.delta; await outbox('put', request);
+      }
+    }
+    return api('PUT', { ...metadata, snapshot: full });
+  }
   function snapshot() {
     const files = [];
     function walk(directory) {
@@ -65,13 +88,24 @@
         if (fs.isDir(stat.mode)) walk(path);
         else if (fs.isFile(stat.mode)) {
           const bytes = fs.readFile(path);
-          let binary = '';
-          for (let i = 0; i < bytes.length; i += 8192) binary += String.fromCharCode(...bytes.subarray(i, i + 8192));
-          files.push({ path: path.slice(root.length + 1), mtime: stat.mtime.getTime(), data: btoa(binary) });
+          const cached = encodedFiles.get(path);
+          let same = cached?.bytes.length === bytes.length;
+          if (same) for (let i = 0; i < bytes.length; i++) {
+            if (bytes[i] !== cached.bytes[i]) { same = false; break; }
+          }
+          let data = cached?.data;
+          if (!same) {
+            let binary = '';
+            for (let i = 0; i < bytes.length; i += 8192) binary += String.fromCharCode(...bytes.subarray(i, i + 8192));
+            data = btoa(binary); encodedFiles.set(path, { bytes: new Uint8Array(bytes), data });
+          }
+          files.push({ path: path.slice(root.length + 1), mtime: stat.mtime.getTime(), data });
         }
       }
     }
     walk(root);
+    const present = new Set(files.map(file => `${root}/${file.path}`));
+    for (const path of encodedFiles.keys()) if (!present.has(path)) encodedFiles.delete(path);
     return { version: 1, files };
   }
   function restore(copy) {
@@ -183,13 +217,14 @@
       if (pendingUpload) { meta.revision = pendingUpload.revision; meta.dirty = true; }
       else if (acknowledgedSlots && acknowledgedSlots.revision > meta.revision) meta.revision = acknowledgedSlots.revision;
       let remote = await api('GET', null, pendingUpload ? `?uploadId=${encodeURIComponent(pendingUpload.uploadId)}` : '');
+      deltaUploads = Boolean(remote.deltaUploads);
       let preserved = false;
       // Receipts outlive history pruning and later writes by other devices.
       if (pendingUpload) {
         if (!local.files.length && pendingUpload.snapshot.files.length) {
           local = pendingUpload.snapshot; restore(local); await flush();
         }
-        const result = remote.acknowledgement || await api('PUT', pendingUpload);
+        const result = remote.acknowledgement || await sendUpload(pendingUpload);
         preserved = result.disposition === 'alternate';
         await acknowledge(pendingUpload.snapshot, result);
         remote = await api('GET');
@@ -212,7 +247,7 @@
         }
         const next = requestFor(local);
         await outbox('put', next); pendingUpload = next;
-        const result = await api('PUT', next);
+        const result = await sendUpload(next);
         preserved ||= result.disposition === 'alternate';
         await acknowledge(local, result);
         remote = await api('GET');
@@ -222,9 +257,11 @@
         await checkpoint(remote.snapshot, remote.revision, remote.saveChecksum);
         meta = { revision: remote.revision, dirty: false, baseSaveChecksum: remote.saveChecksum, alternate: false }; remember();
         lastUploadedContents = contents(remote.snapshot); lastUploadedSlots = slots(remote.snapshot);
+        lastUploadedFiles = new Map(remote.snapshot.files.map(file => [file.path, file.data]));
       } else {
         await checkpoint({ version: 1, files: [] }, 0, remote.saveChecksum);
         meta.revision = 0; meta.baseSaveChecksum = remote.saveChecksum; remember();
+        lastUploadedFiles = new Map();
       }
       status(preserved ? 'Unsynced device saves preserved in history' : 'Saves synced');
     } catch (error) {
@@ -241,8 +278,9 @@
     await outbox('delete'); pendingUpload = null;
     meta.revision = result.revision; meta.baseSaveChecksum = base; meta.alternate = alternate;
     meta.branchId = alternate ? result.branchId : null;
-    meta.dirty = contents(snapshot()) !== contents(copy); remember();
+    meta.dirty = !sameContents(contents(snapshot()), contents(copy)); remember();
     lastUploadedContents = contents(copy); lastUploadedSlots = slots(copy);
+    lastUploadedFiles = alternate ? null : new Map(copy.files.map(file => [file.path, file.data]));
   }
   async function upload() {
     if (!initialized || blocked || busy || !meta.dirty) return;
@@ -250,7 +288,7 @@
     let syncingNotice;
     try {
       const copy = pendingUpload?.snapshot || snapshot(); const copyContents = contents(copy);
-      if (!pendingUpload && copyContents === lastUploadedContents) {
+      if (!pendingUpload && sameContents(copyContents, lastUploadedContents)) {
         meta.dirty = false; remember();
         return;
       }
@@ -269,11 +307,11 @@
       }
       // Fast background uploads should not flash the status on each interaction.
       syncingNotice = setTimeout(() => status('Syncing…'), 500);
-      const result = await api('PUT', pendingUpload);
+      const result = await sendUpload(pendingUpload);
       clearTimeout(syncingNotice);
       await acknowledge(copy, result);
       const current = snapshot();
-      meta.dirty = contents(current) !== copyContents;
+      meta.dirty = !sameContents(contents(current), copyContents);
       if (current.files.some(file => file.path.endsWith('.save') && lastUploadedSlots.get(file.path) !== file.data)) {
         urgentUploadPending = true;
       }
