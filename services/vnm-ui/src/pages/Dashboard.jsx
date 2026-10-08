@@ -15,6 +15,7 @@ export default function Dashboard() {
   const [error, setError] = useState('');
   const [confirmation, setConfirmation] = useState(null);
   const [persistent, setPersistent] = useState(false);
+  const [retentionStatus, setRetentionStatus] = useState('');
   const [storage, setStorage] = useState(null);
   const refresh = useCallback(async () => {
     setError('');
@@ -40,11 +41,11 @@ export default function Dashboard() {
     finally { setBusy(false); }
   };
   const retain = async () => {
-    setBusy(true); setError('');
+    setBusy(true); setRetentionStatus('requesting');
     try {
       const allowed = await navigator.storage?.persist?.(); setPersistent(!!allowed);
-      if (!allowed) setError('Your browser did not grant persistent storage. Downloads can still be retained, but may be removed when space is needed.');
-    } catch { setError('Persistent storage is unavailable in this browser.'); }
+      setRetentionStatus(allowed ? 'granted' : 'denied');
+    } catch { setRetentionStatus('unavailable'); }
     finally { setBusy(false); }
   };
   const total = downloads.reduce((bytes, item) => bytes + item.bytes, 0);
@@ -69,7 +70,11 @@ export default function Dashboard() {
         </li>)}</ul>}
       <div className="border-t border-gray-200 dark:border-gray-700 pt-4 space-y-2">
         <p className="text-sm text-gray-500 dark:text-gray-400">{persistent ? 'Persistent storage is enabled. You can still remove downloads here or clear browser data.' : 'Your browser may remove retained files when storage is needed.'}</p>
-        {!persistent && navigator.storage?.persist && <button disabled={busy} onClick={retain} className="px-3 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-sm disabled:opacity-50">Keep downloads when possible</button>}
+        {!persistent && navigator.storage?.persist && <>
+          <p className="text-sm text-gray-500 dark:text-gray-400">Downloads are already kept automatically. You can ask your browser to protect them from automatic cleanup.</p>
+          <button disabled={busy || retentionStatus === 'denied' || retentionStatus === 'unavailable'} onClick={retain} className="px-3 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-sm disabled:opacity-50">{retentionStatus === 'requesting' ? 'Asking browser…' : retentionStatus === 'denied' ? 'Protection not granted' : retentionStatus === 'unavailable' ? 'Protection unavailable' : 'Protect downloaded files'}</button>
+          {(retentionStatus === 'denied' || retentionStatus === 'unavailable') && <p role="status" className="text-sm text-gray-600 dark:text-gray-300">{retentionStatus === 'denied' ? 'This browser declined the request.' : 'This browser could not enable protection.'} Your downloads still work and will be reused. The browser may remove them when space is needed.</p>}
+        </>}
         {storage?.quota && <p className="text-xs text-gray-500 dark:text-gray-400">This site uses approximately {formatBytes(storage.usage || 0)} of {formatBytes(storage.quota)} available browser storage, including saves and other site data.</p>}
       </div>
     </section>
