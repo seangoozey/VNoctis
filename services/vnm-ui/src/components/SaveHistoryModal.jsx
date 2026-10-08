@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import api from '../hooks/useApi';
+import { importSnapshot, readSaveFolder, snapshotZip } from '../utils/saveFiles';
 
-const kinds = { auto: 'Autosave', manual: 'Manual / quick save', checkpoint: 'Synced checkpoint', restored: 'Restored version' };
+const kinds = { auto: 'Autosave', manual: 'Manual / quick save', checkpoint: 'Synced checkpoint', restored: 'Restored version', imported: 'Imported saves' };
 const requestId = () => window.crypto?.randomUUID?.() || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 const sizeText = bytes => bytes < 1024 ? `${bytes} B` : bytes < 1048576 ? `${(bytes / 1024).toFixed(1)} KB` : `${(bytes / 1048576).toFixed(2)} MB`;
 
@@ -11,6 +12,8 @@ export default function SaveHistoryModal({ gameId, title, onClose, onPlay }) {
   const [loading, setLoading] = useState(true), [busy, setBusy] = useState(false);
   const [error, setError] = useState(''), [notice, setNotice] = useState('');
   const [confirm, setConfirm] = useState(null);
+  const [importPlan, setImportPlan] = useState(null), [folder, setFolder] = useState('');
+  const folderPicker = useRef(null), filePicker = useRef(null), importRequest = useRef(null);
   const card = useRef(null), closeButton = useRef(null), restoreRequest = useRef(null), busyRef = useRef(false);
   busyRef.current = busy;
 
@@ -31,7 +34,7 @@ export default function SaveHistoryModal({ gameId, title, onClose, onPlay }) {
     const handleKey = event => {
       if (event.key === 'Escape' && !busyRef.current) { event.stopImmediatePropagation(); onClose(); }
       if (event.key !== 'Tab') return;
-      const buttons = card.current?.querySelectorAll('button:not(:disabled)');
+      const buttons = card.current?.querySelectorAll('button:not(:disabled), input:not(:disabled):not([type=file]), summary');
       if (!buttons?.length) return;
       const first = buttons[0], last = buttons[buttons.length - 1];
       if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
@@ -48,10 +51,31 @@ export default function SaveHistoryModal({ gameId, title, onClose, onPlay }) {
     setBusy(true); setError('');
     try {
       const copy = await api.get(`${base}/${version.id}`);
-      const url = URL.createObjectURL(new Blob([JSON.stringify(copy)], { type: 'application/json' }));
+      const url = URL.createObjectURL(snapshotZip(copy.snapshot));
       const link = document.createElement('a'); link.href = url;
-      link.download = `vnoctis-saves-${gameId}-${version.id}.json`;
+      link.download = `vnoctis-saves-${gameId}-${version.id}.zip`;
       document.body.append(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (err) { setError(err.message); }
+    finally { setBusy(false); }
+  }
+  async function selectImport(event) {
+    const files = [...event.target.files]; event.target.value = '';
+    if (!files.length) return;
+    setBusy(true); setError(''); setNotice(''); setImportPlan(null); importRequest.current = null;
+    try {
+      const plan = await readSaveFolder(files, history.saveFolders?.[0] || '');
+      setImportPlan(plan); setFolder(plan.folder);
+    } catch (err) { setError(err.message); }
+    finally { setBusy(false); }
+  }
+  async function applyImport() {
+    setBusy(true); setError(''); setNotice('');
+    try {
+      if (!importRequest.current) importRequest.current = { revision: history.currentRevision,
+        uploadId: requestId(), snapshot: importSnapshot(importPlan, folder) };
+      await api.post(`${base}/import`, importRequest.current);
+      importRequest.current = null; setImportPlan(null);
+      setNotice('Saves imported. Launch the game to use them.'); await load();
     } catch (err) { setError(err.message); }
     finally { setBusy(false); }
   }
@@ -85,9 +109,29 @@ export default function SaveHistoryModal({ gameId, title, onClose, onPlay }) {
       </div>
       <div className="px-6 py-4 overflow-y-auto space-y-4">
         <p className="text-sm text-gray-500 dark:text-gray-400">Your saves for this game. Older versions stay here, outside the game’s save slots.</p>
+        <div className="flex flex-wrap items-center gap-2">
+          <button disabled={busy || loading} onClick={() => folderPicker.current?.click()} className="px-3 py-2 min-h-11 rounded-lg bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 text-gray-700 dark:text-white text-sm font-medium transition-colors disabled:opacity-50">Import save folder</button>
+          <button disabled={busy || loading} onClick={() => filePicker.current?.click()} className="px-3 py-2 min-h-11 rounded-lg text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800 text-sm disabled:opacity-50">Choose files instead</button>
+          <input ref={folderPicker} type="file" multiple webkitdirectory="" directory="" hidden aria-label="Save folder" onChange={selectImport} />
+          <input ref={filePicker} type="file" multiple hidden aria-label="Save files" onChange={selectImport} />
+        </div>
+        {importPlan && <div className="p-4 rounded-lg border border-emerald-500/40 space-y-3">
+          <p className="font-medium text-gray-900 dark:text-white">Import {importPlan.files.filter(file => !file.token).length} save files · {sizeText(importPlan.byteSize)}</p>
+          {importPlan.ignored > 0 && <p className="text-xs text-gray-500 dark:text-gray-400">{importPlan.ignored} unrelated files skipped.</p>}
+          <details className="text-xs text-gray-500 dark:text-gray-400"><summary className="cursor-pointer py-2">View selected files</summary>
+            <ul className="max-h-32 overflow-y-auto break-all">{importPlan.files.slice(0, 20).map((file, index) => <li key={index}>{file.token ? 'tokens/' : ''}{file.name}</li>)}</ul>
+            {importPlan.files.length > 20 && <p>And {importPlan.files.length - 20} more files.</p>}
+          </details>
+          <label className="block text-sm text-gray-600 dark:text-gray-300">Save folder name
+            <input value={folder} disabled={busy} onChange={event => { setFolder(event.target.value); importRequest.current = null; }} className="mt-1 w-full rounded-lg border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-800 px-3 py-2 text-gray-900 dark:text-white" />
+          </label>
+          <p className="text-sm text-gray-600 dark:text-gray-300">Use saves for this game/version. Import replaces your synced slots and keeps the current version in history. Close the game first.</p>
+          <p className="text-xs text-gray-500 dark:text-gray-400">Include persistent and security_keys.txt when available.</p>
+        </div>}
         {error && <p role="alert" className="text-sm text-red-600 dark:text-red-400">{error}</p>}
+        {error && importPlan && <button disabled={busy || loading} onClick={() => { importRequest.current = null; load(); }} className="px-3 py-2 min-h-11 rounded-lg bg-gray-100 dark:bg-gray-800 text-sm">Refresh history</button>}
         {notice && <div role="status" className="text-sm text-emerald-600 dark:text-emerald-400 space-y-2">
-          <p>{notice}</p>{notice.startsWith('Version restored') && onPlay && <button disabled={busy} onClick={onPlay} className="px-3 py-2 min-h-11 rounded-lg bg-emerald-600 text-white">Play with restored saves</button>}
+          <p>{notice}</p>{(notice.startsWith('Version restored') || notice.startsWith('Saves imported')) && onPlay && <button disabled={busy} onClick={onPlay} className="px-3 py-2 min-h-11 rounded-lg bg-emerald-600 text-white">{notice.startsWith('Saves imported') ? 'Play with imported saves' : 'Play with restored saves'}</button>}
         </div>}
         {!loading && !error && !history.versions.length && <p className="text-sm text-gray-500 dark:text-gray-400">No save history yet. Versions appear when you save in the game.</p>}
         {history.versions.map(version => {
@@ -115,9 +159,14 @@ export default function SaveHistoryModal({ gameId, title, onClose, onPlay }) {
         })}
         {loading && <p role="status" className="text-sm text-gray-500 dark:text-gray-400">Loading save history…</p>}
       </div>
-      <div className="px-6 py-4 border-t border-gray-200 dark:border-gray-800 flex justify-between">
-        <button disabled={busy || loading} onClick={() => { restoreRequest.current = null; setConfirm(null); load(); }} className="px-3 py-2 min-h-11 rounded-lg bg-gray-100 dark:bg-gray-800 text-sm disabled:opacity-50">Refresh</button>
+      <div className="px-6 py-4 border-t border-gray-200 dark:border-gray-800 flex flex-wrap gap-2 justify-between">
+        {importPlan ? <>
+          <button disabled={busy || loading} onClick={applyImport} className="px-3 py-2 min-h-11 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-sm disabled:opacity-50">Import and use saves</button>
+          <button disabled={busy} onClick={() => { setImportPlan(null); importRequest.current = null; }} className="px-3 py-2 min-h-11 rounded-lg bg-gray-100 dark:bg-gray-800 text-sm">Cancel import</button>
+        </> : <>
+        <button disabled={busy || loading} onClick={() => { restoreRequest.current = null; importRequest.current = null; setConfirm(null); load(); }} className="px-3 py-2 min-h-11 rounded-lg bg-gray-100 dark:bg-gray-800 text-sm disabled:opacity-50">Refresh</button>
         {history.nextOffset !== null && <button disabled={busy || loading} onClick={() => load(history.nextOffset)} className="px-3 py-2 min-h-11 rounded-lg bg-emerald-600 text-white text-sm disabled:opacity-50">Load more</button>}
+        </>}
       </div>
     </div>
   </div>;

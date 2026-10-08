@@ -4,6 +4,18 @@ const { createServer } = require('node:http');
 const { readFileSync } = require('node:fs');
 const { resolve, extname } = require('node:path');
 const assert = require('node:assert/strict');
+function zipFiles(bytes) {
+  const files = new Map(); let offset = 0;
+  while (bytes.readUInt32LE(offset) === 0x04034b50) {
+    assert.equal(bytes.readUInt16LE(offset + 8), 0);
+    const size = bytes.readUInt32LE(offset + 18), length = bytes.readUInt16LE(offset + 26);
+    const start = offset + 30 + length + bytes.readUInt16LE(offset + 28);
+    files.set(bytes.toString('utf8', offset + 30, offset + 30 + length), bytes.subarray(start, start + size));
+    offset = start + size;
+  }
+  assert.ok([0x02014b50, 0x06054b50].includes(bytes.readUInt32LE(offset)));
+  return files;
+}
 const { createHash } = require('node:crypto');
 
 const dist = resolve(__dirname, '../dist');
@@ -53,7 +65,16 @@ const server = createServer(async (request, response) => {
   if (url.pathname === '/api/v1/library') return json([game]);
   if (url.pathname === '/api/v1/library/X') return json(game);
   if (url.pathname === '/api/v1/games/X/saves/history') return json({ currentRevision: state.revision,
-    currentVersionId: state.currentVersionId, versions: versions.map(({ snapshot, ...metadata }) => metadata), nextOffset: null });
+    currentVersionId: state.currentVersionId, saveFolders: ['game'], versions: versions.map(({ snapshot, ...metadata }) => metadata), nextOffset: null });
+  if (url.pathname === '/api/v1/games/X/saves/history/import') {
+    let body = ''; for await (const chunk of request) body += chunk;
+    const imported = JSON.parse(body);
+    if (imported.revision !== state.revision) { response.statusCode = 409; return json({ message: 'Refresh history' }); }
+    state = { revision: state.revision + 1, snapshot: imported.snapshot, currentVersionId: `version-${state.revision + 1}` };
+    versions.unshift({ id: state.currentVersionId, snapshot: state.snapshot, kind: 'imported', alternate: false,
+      revision: state.revision, deviceLabel: 'Imported in launcher', createdAt: new Date().toISOString(), byteSize: 100 });
+    return json({ revision: state.revision });
+  }
   const historyMatch = url.pathname.match(/^\/api\/v1\/games\/X\/saves\/history\/([^/]+)(\/restore)?$/);
   if (historyMatch) {
     const version = versions.find(version => version.id === historyMatch[1]);
@@ -146,7 +167,8 @@ const server = createServer(async (request, response) => {
     const downloadEvent = page.waitForEvent('download');
     await dialog.getByRole('button', { name: 'Download snapshot' }).click();
     const download = await downloadEvent;
-    assert.equal(JSON.parse(readFileSync(await download.path(), 'utf8')).gameId, 'missing-game');
+    assert.ok(download.suggestedFilename().endsWith('.zip'));
+    assert.equal(zipFiles(readFileSync(await download.path())).size, 0);
     await page.setViewportSize({ width: 375, height: 812 });
     const bounds = await dialog.locator('div').first().boundingBox();
     assert.ok(bounds.x >= 0 && bounds.x + bounds.width <= 375 && bounds.height <= 812);
@@ -168,8 +190,11 @@ const server = createServer(async (request, response) => {
     await history.getByText('Current', { exact: true }).waitFor();
     const archiveDownload = page.waitForEvent('download');
     await history.getByRole('button', { name: 'Download', exact: true }).last().click();
-    const archive = JSON.parse(readFileSync(await (await archiveDownload).path(), 'utf8'));
-    assert.equal(archive.snapshot.files.some(file => file.path.includes('quick-')), false);
+    const archiveFile = await archiveDownload;
+    if (process.env.ZIP_PATH) await archiveFile.saveAs(process.env.ZIP_PATH);
+    const archive = zipFiles(readFileSync(await archiveFile.path()));
+    assert.equal([...archive.keys()].some(path => path.includes('quick-')), false);
+    assert.equal(archive.get('game/1-1-LT1.save').toString(), 'numbered save');
     await history.getByRole('button', { name: 'Restore', exact: true }).first().click();
     await history.getByRole('button', { name: 'Restore this version', exact: true }).click();
     await history.getByText('Version restored. Launch the game to use these saves.', { exact: true }).waitFor();
@@ -198,7 +223,30 @@ const server = createServer(async (request, response) => {
     assert.deepEqual(await page.evaluate(() => [document.body.style.overflow, document.body.style.position]), ['', '']);
     assert.equal(await restoredFrame.evaluate(() => new TextDecoder().decode(FS.readFile('/home/web_user/.renpy/game/quick-1-LT1.save'))), 'quick save');
     assert.equal(state.revision, 5, 'launching restored progress must not upload an empty browser tree');
+    await page.goto(`http://127.0.0.1:${server.address().port}/gallery`);
+    await page.getByRole('button', { name: 'More Info', exact: true }).click();
+    await page.getByRole('button', { name: 'Save history', exact: true }).click();
+    await history.getByText('Current', { exact: true }).waitFor();
+    await page.setViewportSize({ width: 375, height: 812 });
+    await history.getByLabel('Save files', { exact: true }).setInputFiles([
+      { name: '1.save', mimeType: 'application/octet-stream', buffer: Buffer.from('imported desktop save') },
+      { name: 'persistent', mimeType: 'application/octet-stream', buffer: Buffer.from('imported preferences') },
+      { name: 'log.txt', mimeType: 'text/plain', buffer: Buffer.from('ignored') },
+    ]);
+    await history.getByRole('button', { name: 'Import and use saves', exact: true }).waitFor();
+    assert.equal(await history.getByLabel('Save folder name').inputValue(), 'game');
+    assert.equal(state.revision, 5, 'Selecting files must not change server saves before confirmation');
+    if (process.env.SCREENSHOT_PATH) await page.screenshot({ path: process.env.SCREENSHOT_PATH });
+    await history.getByRole('button', { name: 'Import and use saves', exact: true }).click();
+    await history.getByText('Saves imported. Launch the game to use them.', { exact: true }).waitFor();
+    assert.equal(state.revision, 6);
+    assert.equal(Buffer.from(state.snapshot.files.find(file => file.path === 'game/1.save').data, 'base64').toString(), 'imported desktop save');
+    assert.equal(state.snapshot.files.some(file => file.path.endsWith('log.txt')), false);
+    const importDownload = page.waitForEvent('download');
+    await history.getByRole('button', { name: 'Download', exact: true }).first().click();
+    const importedZip = zipFiles(readFileSync(await (await importDownload).path()));
+    assert.equal(importedZip.get('game/1.save').toString(), 'imported desktop save');
     assert.deepEqual(errors, []);
-    console.log('PASS: both launchers download/restore personal history, fit mobile, and launch restored files without leaked scroll locks');
+    console.log('PASS: both launchers export ZIP files, restore personal history, fit mobile, and confirm imports before replacing saves');
   } finally { if (browser) await browser.close(); server.close(); }
 })().catch(error => { console.error(error); process.exitCode = 1; });

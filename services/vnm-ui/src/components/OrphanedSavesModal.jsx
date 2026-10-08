@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { snapshotZip } from '../utils/saveFiles';
 
 async function api(path, options = {}) {
   const response = await fetch(`/api/v1/admin/orphaned-saves${path}`, {
@@ -61,9 +62,9 @@ export default function OrphanedSavesModal({ onClose }) {
         await load();
       } else {
         const snapshot = await api(path);
-        const url = URL.createObjectURL(new Blob([JSON.stringify(snapshot)], { type: 'application/json' }));
+        const url = URL.createObjectURL(snapshotZip(snapshot.snapshot));
         const link = document.createElement('a'); link.href = url;
-        link.download = `vnoctis-saves-${item.gameId.replace(/[^A-Za-z0-9_-]/g, '_')}.json`;
+        link.download = `vnoctis-saves-${item.gameId.replace(/[^A-Za-z0-9_-]/g, '_')}.zip`;
         document.body.append(link); link.click(); link.remove();
         setTimeout(() => URL.revokeObjectURL(url), 1000);
       }

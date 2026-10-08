@@ -152,11 +152,27 @@ termination cannot guarantee delivery.
 Both library and gallery game launchers have a **Save history** button. The list
 belongs to the signed-in user and that game, including for administrators; admins
 do not see other users' active-game history here. Versions show save type, device
-label, time, logical snapshot size, and a Current badge. Download exports a JSON
-snapshot. Restore is confirmed and creates a new live version, preserving the
+label, time, logical snapshot size, and a Current badge. Download exports a ZIP
+containing the original binary files at their relative paths (slots, persistent
+data, and signing keys). Extract the game's folder and copy its contents into
+the matching native game's save folder; signing keys belong in Ren'Py's tokens
+folder. The underlying API JSON snapshot remains available for sync clients.
+Restore is confirmed and creates a new live version, preserving the
 exact prior live tree. It is used on the next game launch. A stale restore dialog
 must refresh rather than overwrite an intervening save. Non-current versions can
 be explicitly deleted.
+
+**Import save folder** selects one game's native save folder. **Choose files
+instead** supports browsers without folder selection and lets users include
+`persistent` and `security_keys.txt` alongside `.save` files. The preview maps
+them to the existing web save folder (editable when necessary), lists selected
+files, and reports skipped unrelated files. Import requires confirmation and a
+matching live revision, backs up exact prior progress, creates an `imported`
+history version, and replaces live slots for the next launch. Existing signing
+keys are retained if none were supplied. Repeated requests reuse an upload
+receipt. Paths, file count, file types and aggregate size are validated;
+compatibility with the chosen game/version is the user's responsibility.
+Imports and explicit restores share the last-40 manual version retention.
 
 History is outside Ren'Py's mounted filesystem. The engine's rotating ten
 autosave slots and original filenames are unchanged. A historical restore
@@ -179,7 +195,7 @@ Retention is applied on writes/history access and by hourly maintenance:
 - Autosave/checkpoint versions from the past 24 hours: keep all.
 - Older versions through seven days: keep the newest per hour containing saves.
 - Older versions through thirty days: keep the newest per day containing saves.
-- Manual/quick saves and explicit restores: keep their newest 40 independently.
+- Manual/quick saves, imports, and explicit restores: keep their newest 40 independently.
 - Current live version: always keep.
 - Unresolved alternate continuations: keep until explicitly restored or deleted.
 
@@ -210,7 +226,7 @@ paged at 50 entries; full payloads are fetched only for downloads.
 
 Deleting orphaned saves also deletes that user's history and receipts for the
 game, without removing shared content still referenced by another user/version.
-Downloads are the current versioned JSON snapshot containing opaque save bytes and game
+The orphaned-save API returns the current versioned JSON snapshot containing opaque save bytes and game
 identity, not a native Ren'Py save ZIP. No reassignment/import UI or active-game
 purge is included. The live snapshot has no automatic expiration; history follows
 the retention policy above. Renaming a

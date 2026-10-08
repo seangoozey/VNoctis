@@ -234,7 +234,7 @@ export default function GalleryDetailModal({ gameId, onClose, galleryPlayPath, o
                     </svg>
                     Play
                   </button>
-                  <button onClick={() => setShowSaveHistory(true)} className="px-4 py-2 min-h-11 rounded-lg bg-gray-800 hover:bg-gray-700 text-sm font-medium text-gray-200">Save history</button>
+                  <button onClick={() => setShowSaveHistory(true)} className="flex items-center gap-2 px-4 py-2.5 bg-gray-700 hover:bg-gray-600 text-white font-medium rounded-md text-sm transition-colors"><span aria-hidden="true">💾</span>Save history</button>
                   {onFavorite && (
                     <button
                       onClick={() => {

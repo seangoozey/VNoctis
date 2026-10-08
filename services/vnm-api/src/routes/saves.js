@@ -205,8 +205,46 @@ export default async function savesRoutes(fastify) {
         skip: request.query.offset, take: 51, select: { id: true, kind: true, alternate: true, baseRevision: true,
           revision: true, deviceLabel: true, createdAt: true, byteSize: true, restoredFrom: true } });
       return { currentRevision: state?.revision || 0, currentVersionId,
+        saveFolders: [...new Set((state ? JSON.parse(state.payload).files : []).filter(file => file.path.endsWith('.save'))
+          .map(file => file.path.split('/').slice(0, -1).join('/')).filter(Boolean))],
         versions: versions.slice(0, 50), nextOffset: versions.length > 50 ? request.query.offset + 50 : null };
     });
+  });
+  fastify.post('/games/:gameId/saves/history/import', options, async (request, reply) => {
+    const { revision, uploadId, snapshot } = request.body || {};
+    if (!Number.isSafeInteger(revision) || revision < 0 || revision >= 2147483647 ||
+        typeof uploadId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(uploadId) || !validateSnapshot(snapshot) ||
+        !snapshot.files.some(file => file.path.endsWith('.save')) || snapshot.files.some(file => file.path.includes(':') ||
+          (!file.path.endsWith('.save') && file.path.split('/').at(-1) !== 'persistent' && file.path !== 'tokens/security_keys.txt'))) {
+      return reply.code(400).send({ message: 'Select valid Ren’Py save files, persistent data, and optional signing keys (up to 32 MB).' });
+    }
+    const key = { userId: request.user.userId, gameId: request.params.gameId };
+    const marker = digest(`import:${JSON.stringify(canonical(snapshot))}`);
+    const result = await writeTransaction(fastify.prisma, async tx => {
+      const state = await tx.saveSyncState.findUnique({ where: { userId_gameId: key } });
+      const receipt = await tx.saveUploadReceipt.findUnique({ where: { userId_gameId_uploadId: { ...key, uploadId } } });
+      if (receipt) return receipt.checksum === marker ? receiptResponse(receipt, state?.revision || 0) : { error: 'Upload ID already used for different save data.' };
+      if (revision !== (state?.revision || 0)) return { error: 'Synced saves changed. Refresh history and review the import again.' };
+      const copy = canonical(snapshot);
+      // Keep existing signing keys if the user selected just the game folder.
+      // An explicitly imported key file takes precedence.
+      if (state && !copy.files.some(file => file.path === 'tokens/security_keys.txt')) {
+        const previous = await readCurrent(tx, state);
+        copy.files.push(...previous.files.filter(file => file.path === 'tokens/security_keys.txt'));
+      }
+      if (!validateSnapshot(copy)) return { error: 'The imported snapshot exceeds the save limits.', status: 400 };
+      if (state) await ensureCurrentVersion(tx, state, true);
+      const nextRevision = revision + 1;
+      const versionId = await archive(tx, copy, { ...key, gameTitle: request.saveGameTitle, kind: 'imported',
+        baseRevision: revision, revision: nextRevision, deviceLabel: 'Imported in launcher' });
+      await writeCurrent(tx, key, copy, { checksum: digest(JSON.stringify(canonical(copy))), uploadId,
+        revision: nextRevision, currentVersionId: versionId, gameTitle: request.saveGameTitle });
+      const accepted = await tx.saveUploadReceipt.create({ data: { ...key, uploadId, checksum: marker,
+        revision: nextRevision, disposition: 'current', versionId, saveChecksum: saveChecksum(copy) } });
+      await prune(tx, key, versionId);
+      return receiptResponse(accepted, nextRevision);
+    });
+    return result.error ? reply.code(result.status || 409).send({ message: result.error }) : result;
   });
   const versionOptions = { ...options, schema: { params: { ...options.schema.params,
     required: ['gameId', 'versionId'], properties: { ...options.schema.params.properties,

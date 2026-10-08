@@ -372,7 +372,7 @@ export default function GameDetailModal({ gameId, onClose, onDeleted, onHide, on
                   >
                     {isBuilt ? '▶ Play' : '▶ Build & Play'}
                   </button>
-                  <button onClick={() => setShowSaveHistory(true)} className="px-4 py-2 min-h-11 rounded-lg bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 text-sm font-medium">Save history</button>
+                  <button onClick={() => setShowSaveHistory(true)} className="px-4 py-2.5 bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 text-gray-700 dark:text-white font-medium rounded-lg transition-colors duration-200 text-sm"><span aria-hidden="true">💾 </span>Save history</button>
                   {isAdmin && (
                     buildTriggered ? (
                       <a

@@ -117,7 +117,7 @@ export function retainedIds(versions, currentId, now = Date.now()) {
   const day = 86400000;
   for (const version of [...versions].sort((a, b) => +new Date(b.createdAt) - +new Date(a.createdAt) || b.id.localeCompare(a.id))) {
     if (version.alternate) { keep.add(version.id); continue; }
-    if (version.kind === 'manual' || version.kind === 'restored') {
+    if (version.kind === 'manual' || version.kind === 'restored' || version.kind === 'imported') {
       if (++manual <= 40) keep.add(version.id);
       continue;
     }

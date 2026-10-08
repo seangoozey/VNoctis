@@ -211,6 +211,32 @@ test('deduplicated server history restores rotating RenPy slots without adding f
       assert.equal((await ownCall('GET', '')).json().revision, 3);
       assert.equal((await ownCall('PUT', '', { ...patch, delta: { ...patch.delta, files: [{ ...changed, data: encoded('reused ID') }] } })).statusCode, 409);
     });
+    await t.test('folder imports back up current saves, preserve keys, isolate users, and retry idempotently', async () => {
+      const ownCall = (method, path, body) => call(method, path, body, 'B', 'Y');
+      const before = (await ownCall('GET', '')).json();
+      const priorCount = await prisma.saveVersion.count({ where: { userId: 'B', gameId: 'Y' } });
+      const snapshot = { version: 1, files: [{ path: 'game/1.save', mtime: 1234, data: encoded('imported native progress') }] };
+      const body = { revision: before.revision, uploadId: 'folder-import', snapshot };
+      assert.equal((await ownCall('POST', '/history/import', { ...body, revision: 0 })).statusCode, 409);
+      const imported = await ownCall('POST', '/history/import', body);
+      assert.equal(imported.statusCode, 200, imported.body);
+      const after = (await ownCall('GET', '')).json();
+      assert.equal(after.revision, before.revision + 1);
+      assert.equal(after.snapshot.files.find(file => file.path === 'game/1.save').data, snapshot.files[0].data);
+      assert.equal(after.snapshot.files.filter(file => file.path.endsWith('.save')).length, 1);
+      assert.equal(after.snapshot.files.find(file => file.path === 'tokens/security_keys.txt').data,
+        before.snapshot.files.find(file => file.path === 'tokens/security_keys.txt').data);
+      const version = await prisma.saveVersion.findUnique({ where: { id: imported.json().versionId } });
+      assert.equal(version.kind, 'imported');
+      assert.equal((await ownCall('POST', '/history/import', body)).json().versionId, version.id);
+      assert.equal(await prisma.saveVersion.count({ where: { userId: 'B', gameId: 'Y' } }), priorCount + 1);
+      assert.equal((await call('GET', `/history/${version.id}`, undefined, 'A', 'Y')).statusCode, 404);
+      assert.equal((await ownCall('POST', '/history/import', { ...body, snapshot: { version: 1, files: [{ path: '../1.save', mtime: 0, data: '' }] } })).statusCode, 400);
+      assert.equal((await ownCall('POST', '/history/import', { ...body, snapshot: { version: 1, files: [{ path: 'game/1.save', mtime: 1, data: encoded('different') }] } })).statusCode, 409);
+      const restore = await ownCall('POST', `/history/${before.currentVersionId}/restore`, { revision: after.revision, uploadId: 'restore-before-import' });
+      assert.equal(restore.statusCode, 200);
+      assert.deepEqual((await ownCall('GET', '')).json().snapshot, before.snapshot);
+    });
   } finally {
     await app.close(); await prisma.$disconnect(); rmSync(directory, { recursive: true, force: true });
   }
