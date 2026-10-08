@@ -89,8 +89,9 @@ wrong folder cannot be detected automatically.
 
 Offline edits keep their last acknowledged server revision and a dirty flag.
 Browser filesystem writes remain immediate. Written or atomically renamed
-`.save` slots trigger a server upload as soon as the browser filesystem flush
-succeeds. A slot written during an upload follows immediately after its
+`.save` slots schedule a browser filesystem flush after the engine's synchronous
+writes finish, without waiting for its periodic flush. They trigger a server
+upload as soon as that flush succeeds. A slot written during an upload follows immediately after its
 acknowledgement. Persistent-only writes are batched every five seconds, and
 failed uploads are retried on that interval and on reconnect. Closing or killing
 the tab during a transfer can still interrupt it; unacknowledged browser data
@@ -147,7 +148,10 @@ it never adds ninety autosave files to the live folder.
 
 `SaveVersion` metadata and `SaveVersionFile` manifests refer to `SaveFileBlob`
 rows keyed by SHA-256 of decoded file bytes. Identical content is shared even
-across renamed/rotated slots. Removing versions garbage-collects only blobs with
+across renamed/rotated slots. Uploads check existing blob hashes before inserting
+bytes, so unchanged files are not passed back to the database. Retention scans
+for unused blobs only when versions are removed, plus the periodic sweep.
+Removing versions garbage-collects only blobs with
 no remaining references. Each manifest is immutable; the live snapshot remains
 separate. Existing synced data is archived lazily on first access/replacement.
 History cannot recover saves overwritten before deployment.

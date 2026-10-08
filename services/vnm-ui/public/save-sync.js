@@ -293,6 +293,17 @@
     originalGetDB = IDBFS.getDB.bind(IDBFS);
     IDBFS.getDB = (name, callback) => originalGetDB(name === root ? namespace : name, callback);
     nativeSync = fs.syncfs.bind(fs);
+    let slotFlushTimer, flushes = 0;
+    const scheduleSlotFlush = () => {
+      slotWritePending = true;
+      if (slotFlushTimer !== undefined) return;
+      // Let the engine finish its synchronous writes/renames, then persist the
+      // completed slot ourselves instead of waiting for its periodic syncfs.
+      slotFlushTimer = setTimeout(() => {
+        slotFlushTimer = undefined;
+        if (slotWritePending && !flushes) fs.syncfs(false);
+      }, 0);
+    };
     const isSaveSlot = path => typeof path === 'string' && path.startsWith(`${root}/`) && path.endsWith('.save');
     // Ren'Py writes slots directly or renames a temporary file into place.
     // Watch these operations without scanning/encoding the tree on every frame.
@@ -300,13 +311,13 @@
     fs.close = stream => {
       const wroteSlot = initialized && (stream.flags & 3) !== 0 && isSaveSlot(stream.path);
       const result = nativeClose(stream);
-      if (wroteSlot) slotWritePending = true;
+      if (wroteSlot) scheduleSlotFlush();
       return result;
     };
     const nativeRename = fs.rename.bind(fs);
     fs.rename = (from, to) => {
       const result = nativeRename(from, to);
-      if (initialized && isSaveSlot(to)) slotWritePending = true;
+      if (initialized && isSaveSlot(to)) scheduleSlotFlush();
       return result;
     };
     fs.syncfs = (populate, callback = () => {}) => {
@@ -314,7 +325,9 @@
         meta.dirty = true;
         try { remember(); } catch { blocked = true; status('Browser storage full — sync paused'); }
       }
+      flushes++;
       nativeSync(populate, err => {
+        flushes--;
         if (err) { status('Browser save storage failed'); callback(err); return; }
         if (populate && !initialized) {
           start().finally(() => {

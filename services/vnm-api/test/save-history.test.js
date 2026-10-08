@@ -6,9 +6,35 @@ import { join } from 'node:path';
 import Fastify from 'fastify';
 import { PrismaClient } from '@prisma/client';
 import savesRoutes from '../src/routes/saves.js';
-import { retainedIds, saveChecksum } from '../src/services/saveHistory.js';
+import { archive, digest, prune, retainedIds, saveChecksum } from '../src/services/saveHistory.js';
 
 const encoded = value => Buffer.from(value).toString('base64');
+test('history uploads only new blob bytes and skips garbage collection when nothing expires', async () => {
+  const previous = Buffer.from('existing save');
+  const added = Buffer.from('new save');
+  const writes = [];
+  const tx = {
+    saveFileBlob: { findMany: async () => [{ hash: digest(previous) }] },
+    $executeRawUnsafe: async (...args) => { writes.push(args); },
+    saveVersion: {
+      create: async () => {},
+      findMany: async () => [{ id: 'current', kind: 'manual', alternate: false, createdAt: new Date() }],
+      deleteMany: async () => { assert.fail('Current version must remain'); },
+    },
+    saveVersionFile: { createMany: async () => {} },
+  };
+  await archive(tx, { version: 1, files: [
+    { path: '1.save', mtime: 1, data: previous.toString('base64') },
+    { path: '2.save', mtime: 1, data: added.toString('base64') },
+  ] }, { userId: 'A', gameId: 'X', kind: 'manual' });
+  assert.equal(writes.length, 1);
+  assert.equal(writes[0][1], digest(added));
+  assert.deepEqual(writes[0][2], added);
+  assert.equal(writes[0].length, 4);
+  await prune(tx, { userId: 'A', gameId: 'X' }, 'current');
+  assert.equal(writes.length, 1, 'No global blob scan for a retained version');
+});
+
 const autoSnapshot = step => ({ version: 1, files: [
   ...Array.from({ length: 10 }, (_, index) => ({ path: `game/auto-${index + 1}-LT1.save`, mtime: 1000,
     data: encoded(`progress ${Math.max(0, step - index)}`) })),

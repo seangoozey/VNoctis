@@ -47,6 +47,7 @@ export default async function savesRoutes(fastify) {
   fastify.addHook('onClose', async () => { clearInterval(retentionTimer); await retentionTask; });
   const options = {
     bodyLimit: 46 * 1024 * 1024,
+    onRequest: async request => { request.saveStartedAt = performance.now(); },
     schema: { params: { type: 'object', required: ['gameId'], properties: {
       gameId: { type: 'string', minLength: 1, maxLength: 128, pattern: '^[A-Za-z0-9_-]+$' },
     } }, querystring: { type: 'object', properties: { uploadId: { type: 'string', maxLength: 128, pattern: '^[A-Za-z0-9_-]+$' } } } },
@@ -73,6 +74,15 @@ export default async function savesRoutes(fastify) {
       acknowledgement: acknowledgement ? receiptResponse(acknowledgement, state?.revision || 0) : null };
   });
   fastify.put('/games/:gameId/saves', options, async (request, reply) => {
+    const timings = {};
+    let measuredAt = request.saveStartedAt ?? performance.now();
+    const startedAt = measuredAt;
+    const mark = name => {
+      const now = performance.now();
+      timings[name] = Math.round((now - measuredAt) * 10) / 10;
+      measuredAt = now;
+    };
+    mark('beforeHandlerMs');
     const { revision, snapshot, uploadId = null, baseSaveChecksum = null, alternate = false, branchId = null, deviceLabel = 'Browser' } = request.body || {};
     if (!Number.isSafeInteger(revision) || revision < 0 || revision >= 2147483647 || !validateSnapshot(snapshot) ||
         (uploadId !== null && (typeof uploadId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(uploadId))) ||
@@ -86,9 +96,12 @@ export default async function savesRoutes(fastify) {
     const checksum = createHash('sha256').update(payload).digest('hex');
     const key = { userId: request.user.userId, gameId: request.params.gameId };
     const id = uploadId || digest(`${revision}:${payload}`);
+    mark('validateAndHashMs');
     const result = await writeTransaction(fastify.prisma, async tx => {
+      mark('queueAndBeginMs');
       const state = await tx.saveSyncState.findUnique({ where: { userId_gameId: key } });
       const receipt = await tx.saveUploadReceipt.findUnique({ where: { userId_gameId_uploadId: { ...key, uploadId: id } } });
+      mark('readStateMs');
       if (receipt) return receipt.checksum === checksum ? receiptResponse(receipt, state?.revision || 0)
         : { error: 'Upload ID already used for different save data.' };
       const previous = state ? canonical(JSON.parse(state.payload)) : { version: 1, files: [] };
@@ -102,9 +115,11 @@ export default async function savesRoutes(fastify) {
       const divergent = Boolean(state && (alternate || (revision !== state.revision &&
         baseSaveChecksum !== serverSlots && incomingSlots !== serverSlots)));
       const kind = saveKind(previous, copy);
+      mark('compareMs');
       // Existing saves are archived lazily before their first replacement.
       let currentVersionId = state?.currentVersionId || null;
       if (state && (kind || divergent || !currentVersionId)) currentVersionId = await ensureCurrentVersion(tx, state);
+      mark('ensureHistoryMs');
       const nextRevision = divergent ? revision : (state?.revision || 0) + 1;
       const continuation = divergent ? branchId || id : null;
       let versionId = null;
@@ -113,17 +128,26 @@ export default async function savesRoutes(fastify) {
           kind: kind || 'checkpoint', alternate: Boolean(divergent), branchId: continuation, baseRevision: revision,
           revision: nextRevision, deviceLabel });
       }
+      mark('archiveMs');
       if (!divergent) {
         if (versionId) currentVersionId = versionId;
         const data = { payload, checksum, uploadId: id, gameTitle: request.saveGameTitle, revision: nextRevision, currentVersionId };
         await tx.saveSyncState.upsert({ where: { userId_gameId: key }, create: { ...key, ...data }, update: data });
       }
+      mark('writeCurrentMs');
       const accepted = await tx.saveUploadReceipt.create({ data: { ...key, uploadId: id, checksum,
         revision: nextRevision, disposition: divergent ? 'alternate' : 'current', versionId, branchId: continuation,
         saveChecksum: incomingSlots } });
+      mark('receiptMs');
       if (versionId) await prune(tx, key, currentVersionId);
+      mark('pruneMs');
       return receiptResponse(accepted, divergent ? state?.revision || 0 : nextRevision);
     });
+    mark('commitMs');
+    const totalMs = Math.round((performance.now() - startedAt) * 10) / 10;
+    if (totalMs >= 500) request.log.info({ saveTiming: { totalMs, ...timings,
+      files: copy.files.length, snapshotBytes: Buffer.byteLength(payload),
+    } }, 'Slow save upload');
     return result.error ? reply.code(409).send({ message: result.error }) : result;
   });
 

@@ -278,6 +278,20 @@ test('direct and atomic slot writes upload after flush without waiting for the t
   assert.equal(a.events.filter(event => event.saveUploaded).length, 2);
 });
 
+test('completed slot writes persist and upload without an engine flush or retry timer', async () => {
+  const server = new Map(), databases = new Map(); const a = browser(server, databases); await a.start();
+  a.fs.mkdirTree(`${root}/game`);
+  a.fs.writeFile(`${root}/game/1.save`, Buffer.from('manual save'));
+  await new Promise(resolve => setTimeout(resolve, 20)); await settle();
+  assert.equal(server.get('A:X').revision, 1);
+  assert.ok(databases.get(a.namespace).files.has(`${root}/game/1.save`), 'Persist before acknowledging');
+  a.fs.writeFile(`${root}/game/temp`, Buffer.from('quick save'));
+  a.fs.rename(`${root}/game/temp`, `${root}/game/quick-1.save`);
+  await new Promise(resolve => setTimeout(resolve, 20)); await settle();
+  assert.equal(server.get('A:X').revision, 2);
+  assert.equal(a.events.filter(event => event.saveUploaded).length, 2);
+});
+
 test('a slot saved during an upload follows immediately after its acknowledgement', async () => {
   const server = new Map(); const a = browser(server, new Map()); await a.start();
   const release = a.pauseNextUpload();

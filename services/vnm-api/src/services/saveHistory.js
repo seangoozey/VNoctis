@@ -31,7 +31,16 @@ export async function archive(tx, snapshot, details) {
     const bytes = Buffer.from(file.data, 'base64'); const hash = digest(bytes);
     unique.set(hash, bytes); return { path: file.path, mtime: file.mtime, hash };
   });
-  const entries = [...unique];
+  // Most files already exist, especially when Ren'Py rotates autosave slots.
+  // Check small hashes first instead of repeatedly passing every save's bytes
+  // through the database engine for INSERT OR IGNORE to discard them.
+  const existing = new Set();
+  const hashes = [...unique.keys()];
+  for (let i = 0; i < hashes.length; i += 100) {
+    const rows = await tx.saveFileBlob.findMany({ where: { hash: { in: hashes.slice(i, i + 100) } }, select: { hash: true } });
+    for (const row of rows) existing.add(row.hash);
+  }
+  const entries = [...unique].filter(([hash]) => !existing.has(hash));
   for (let i = 0; i < entries.length; i += 100) {
     const batch = entries.slice(i, i + 100);
     await tx.$executeRawUnsafe(`INSERT OR IGNORE INTO SaveFileBlob (hash,data,size) VALUES ${batch.map(() => '(?,?,?)').join(',')}`,
@@ -99,7 +108,9 @@ export async function prune(tx, key, currentId, now) {
   const keep = retainedIds(versions, currentId, now);
   const remove = versions.filter(version => !keep.has(version.id)).map(version => version.id);
   for (let i = 0; i < remove.length; i += 100) await tx.saveVersion.deleteMany({ where: { ...key, id: { in: remove.slice(i, i + 100) } } });
-  await collectBlobs(tx);
+  // Adding a version cannot orphan a blob. Only scan for unused bytes when
+  // retention actually removed versions; the periodic sweep also catches them.
+  if (remove.length) await collectBlobs(tx);
 }
 
 export async function pruneAll(prisma) {
