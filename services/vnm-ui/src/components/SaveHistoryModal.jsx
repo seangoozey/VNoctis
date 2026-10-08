@@ -109,6 +109,7 @@ export default function SaveHistoryModal({ gameId, title, onClose, onPlay }) {
       </div>
       <div className="px-6 py-4 overflow-y-auto space-y-4">
         <p className="text-sm text-gray-500 dark:text-gray-400">Your saves for this game. Older versions stay here, outside the game’s save slots.</p>
+        <p className="text-xs text-gray-500 dark:text-gray-400">Desktop saves may work when imported here. Downloaded ZIPs preserve the original save files, but may not load in the desktop game—even for the same game release—because VNoctis can use a different Ren’Py engine version. Compatibility can differ in each direction.</p>
         <div className="flex flex-wrap items-center gap-2">
           <button disabled={busy || loading} onClick={() => folderPicker.current?.click()} className="px-3 py-2 min-h-11 rounded-lg bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 text-gray-700 dark:text-white text-sm font-medium transition-colors disabled:opacity-50">Import save folder</button>
           <button disabled={busy || loading} onClick={() => filePicker.current?.click()} className="px-3 py-2 min-h-11 rounded-lg text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800 text-sm disabled:opacity-50">Choose files instead</button>
@@ -125,7 +126,7 @@ export default function SaveHistoryModal({ gameId, title, onClose, onPlay }) {
           <label className="block text-sm text-gray-600 dark:text-gray-300">Save folder name
             <input value={folder} disabled={busy} onChange={event => { setFolder(event.target.value); importRequest.current = null; }} className="mt-1 w-full rounded-lg border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-800 px-3 py-2 text-gray-900 dark:text-white" />
           </label>
-          <p className="text-sm text-gray-600 dark:text-gray-300">Use saves for this game/version. Import replaces your synced slots and keeps the current version in history. Close the game first.</p>
+          <p className="text-sm text-gray-600 dark:text-gray-300">Use saves from a compatible release of this game; matching game versions alone does not guarantee Ren’Py engine compatibility. Import replaces your synced slots and keeps the current version in history. Close the game first.</p>
           <p className="text-xs text-gray-500 dark:text-gray-400">Include persistent and security_keys.txt when available.</p>
         </div>}
         {error && <p role="alert" className="text-sm text-red-600 dark:text-red-400">{error}</p>}
