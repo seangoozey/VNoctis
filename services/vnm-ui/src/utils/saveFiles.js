@@ -65,7 +65,9 @@ export async function readSaveFolder(selected, suggestedFolder = '') {
   const included = entries.filter(entry => saves.includes(entry) || entry.path === (parent ? `${parent}/persistent` : 'persistent') ||
     /(^|\/)tokens\/security_keys\.txt$/.test(entry.path) || entry.path === 'security_keys.txt');
   if (included.length > 4096 || included.reduce((size, entry) => size + entry.file.size, 0) > MAX_BYTES) throw new Error('Save imports are limited to 4096 files and 32 MB.');
-  const folder = suggestedFolder || parent || files.find(file => file.webkitRelativePath)?.webkitRelativePath.split('/')[0] || '';
+  // A PC save folder may be renamed or simply called "saves". Its name tells
+  // us nothing about the web runtime's configured destination.
+  const folder = suggestedFolder;
   const imported = [];
   for (const { file, path } of included) {
     const bytes = new Uint8Array(await file.arrayBuffer());

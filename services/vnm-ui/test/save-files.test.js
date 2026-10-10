@@ -56,3 +56,13 @@ test('folder import rejects unrelated, multi-game, oversize, duplicate, and unsa
   assert.throws(() => importSnapshot(duplicate, 'Game'), /duplicate/);
   assert.throws(() => importSnapshot(duplicate, '../Game'), /valid/);
 });
+
+test('renamed desktop folders never determine the web save destination', async () => {
+  for (const path of ['saves/1.save', 'Renamed/Game/1.save']) {
+    const plan = await readSaveFolder([file(path, [1])]);
+    assert.equal(plan.folder, '');
+    assert.throws(() => importSnapshot(plan, plan.folder), /valid/);
+    const known = await readSaveFolder([file(path, [1])], 'Lewd Town Adventures');
+    assert.equal(importSnapshot(known, known.folder).files[0].path, 'Lewd Town Adventures/1.save');
+  }
+});

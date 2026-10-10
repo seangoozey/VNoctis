@@ -33,11 +33,13 @@ model Game {
   buildJobId        String?                               // Most recent build job ID
   builtAt           DateTime?                             // Last successful build time
   webBuildPath      String?                               // URL to compiled web export
+  webSaveDirectory  String?                               // Literal default captured by the web build
   metadataSource    String         @default("unmatched")  // auto|manual|unmatched
   metadataFetchedAt DateTime?                             // Last VNDB fetch time
   createdAt         DateTime       @default(now())
   updatedAt         DateTime       @updatedAt
   favoritedBy       UserFavorite[]                        // Per-user favorites (replaces global favorite)
+  saveDirectories  SaveRuntimeDirectory[]
 }
 
 model User {
@@ -51,6 +53,19 @@ model User {
   saves        SaveSyncState[]
   saveVersions SaveVersion[]
   saveReceipts SaveUploadReceipt[]
+  saveDirectories SaveRuntimeDirectory[]
+}
+
+// Runtime metadata is independent of snapshots: launching need not create a save.
+model SaveRuntimeDirectory {
+  userId    String
+  gameId    String
+  directory String
+  updatedAt DateTime @updatedAt
+  user      User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  game      Game @relation(fields: [gameId], references: [id], onDelete: Cascade)
+
+  @@id([userId, gameId])
 }
 
 model SaveSyncState {

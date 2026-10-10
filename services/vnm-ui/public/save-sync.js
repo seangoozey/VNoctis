@@ -58,6 +58,9 @@
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
       ...(body ? { body: JSON.stringify(body) } : {}),
     });
+    if (response.status === 409 && query === '/directory') {
+      throw Object.assign(new Error('Save directory belongs to a different build'), { code: 'SAVE_BUILD_CHANGED' });
+    }
     if (response.status === 409) {
       const details = await response.json();
       if (details.code === 'SAVE_BASE_CHANGED') throw Object.assign(new Error(details.message), { code: details.code });
@@ -66,6 +69,27 @@
     if (!response.ok) throw new Error(`Save service unavailable (${response.status})`);
     return response.json();
   };
+  let directoryPending = false, directoryRecorded = false;
+  async function recordDirectory() {
+    if (directoryPending || directoryRecorded || typeof window.renpy_get !== 'function') return;
+    directoryPending = true;
+    try {
+      // Query the initialized engine rather than guessing from game titles or
+      // uploaded PC paths. This metadata must not delay saves or game startup.
+      const savedir = await window.renpy_get('config.savedir');
+      if (typeof savedir !== 'string' || !savedir.startsWith(`${root}/`)) return;
+      const directory = savedir.slice(root.length + 1).replace(/\/+$/, '');
+      if (!directory || directory.length > 400 || /[\\:\x00-\x1f]/.test(directory) ||
+          directory.split('/').some(part => !part || part === '.' || part === '..') || directory.split('/')[0] === 'tokens') return;
+      await api('POST', { directory, buildVersion: params.get('vnmBuild') || null }, '/directory');
+      directoryRecorded = true;
+    } catch (error) {
+      // An old open tab must not replace metadata from a newly built game.
+      if (error.code === 'SAVE_BUILD_CHANGED') directoryRecorded = true;
+      /* Offline or older API: retry later without affecting sync. */
+    }
+    finally { directoryPending = false; }
+  }
   async function sendUpload(request) {
     const { snapshot: full, delta, ...metadata } = request;
     if (delta) {
@@ -388,7 +412,8 @@
   }];
   function resume() {
     if (!initialized) return;
-    clearInterval(timer); timer = setInterval(upload, 5000); upload();
+    clearInterval(timer); timer = setInterval(() => { upload(); recordDirectory(); }, 5000);
+    upload(); recordDirectory();
   }
   window.addEventListener('online', upload);
   window.addEventListener('pagehide', () => { clearInterval(timer); timer = undefined; upload(); });

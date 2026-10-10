@@ -12,7 +12,7 @@ const saveHash = copy => createHash('sha256').update(JSON.stringify((copy?.files
   .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0))).digest('hex');
 
 // Model the IDBFS populate/flush boundary rather than Ren'Py save semantics.
-function browser(server, databases, { user = 'A', game = 'X', metadata = new Map(), choices = [] } = {}) {
+function browser(server, databases, { user = 'A', game = 'X', metadata = new Map(), choices = [], savedir } = {}) {
   server.receipts ||= new Map(); server.alternates ||= [];
   server.uploads ||= [];
   const files = new Map(); const dirs = new Set([root]); const statuses = [];
@@ -52,6 +52,7 @@ function browser(server, databases, { user = 'A', game = 'X', metadata = new Map
     localStorage: { getItem: key => metadata.get(key) ?? null, setItem: (key, value) => metadata.set(key, value) },
     parent: { postMessage: data => { statuses.push(data.message); events.push(data); } },
     Module: { FS: fs },
+    ...(savedir === undefined ? {} : { renpy_get: async expression => { assert.equal(expression, 'config.savedir'); return savedir; } }),
     IDBFS: { getDB: (name, callback) => {
       if (!databases.has(name)) databases.set(name, { files: new Map() });
       const db = databases.get(name);
@@ -106,6 +107,12 @@ function browser(server, databases, { user = 'A', game = 'X', metadata = new Map
           acknowledgement: server.receipts.get(`${key}:${id}`)?.response || null }) };
       }
       const body = JSON.parse(options.body);
+      if (url.endsWith('/directory') && options.method === 'POST') {
+        server.directoryRequests = (server.directoryRequests || 0) + 1;
+        if (server.directoryStatus === 409) return { ok: false, status: 409, json: async () => ({ code: 'SAVE_BUILD_CHANGED' }) };
+        server.directories ||= new Map(); server.directories.set(key, body.directory);
+        return { ok: true, status: 200, json: async () => body };
+      }
       server.uploads.push(structuredClone(body));
       const identity = JSON.stringify(body.delta || body.snapshot);
       const receiptKey = `${key}:${body.uploadId}`, receipt = server.receipts.get(receiptKey);
@@ -155,6 +162,29 @@ function browser(server, databases, { user = 'A', game = 'X', metadata = new Map
     async retry() { await interval(); await settle(); },
   };
 }
+
+test('runtime directory reporting is independent of saves and retries after offline startup', async () => {
+  const server = new Map();
+  const a = browser(server, new Map(), { savedir: `${root}/Lewd Town Adventures` });
+  a.offline(true); await a.start();
+  assert.equal(server.directories, undefined);
+  a.offline(false); await a.retry();
+  assert.equal(server.directories.get('A:X'), 'Lewd Town Adventures');
+  assert.equal(server.has('A:X'), false); assert.equal(server.uploads.length, 0);
+  for (const savedir of ['/game/saves', `${root}/../Other`, `${root}/tokens`, `${root}/Game//saves`]) {
+    const b = browser(server, new Map(), { user: 'B', savedir }); await b.start();
+    assert.equal(server.directories.has('B:X'), false);
+  }
+});
+
+test('a stale build directory report stops retrying without pausing save uploads', async () => {
+  const server = new Map(); server.directoryStatus = 409;
+  const a = browser(server, new Map(), { savedir: `${root}/game` }); await a.start();
+  await a.save('still playing'); await a.retry();
+  assert.equal(server.directoryRequests, 1);
+  assert.equal(server.get('A:X').snapshot.files[0].data, Buffer.from('still playing').toString('base64'));
+  assert.ok(a.statuses.includes('Saves synced'));
+});
 
 test('device handoff retains complete files and isolates users and games', async () => {
   const server = new Map();

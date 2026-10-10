@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import api from '../hooks/useApi';
-import { importSnapshot, readSaveFolder, snapshotZip } from '../utils/saveFiles';
+import { importSnapshot, readSaveFolder, snapshotZip, validPath } from '../utils/saveFiles';
 
 const kinds = { auto: 'Autosave', manual: 'Manual / quick save', checkpoint: 'Synced checkpoint', restored: 'Restored version', imported: 'Imported saves' };
 const requestId = () => window.crypto?.randomUUID?.() || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
@@ -21,6 +21,7 @@ export default function SaveHistoryModal({ gameId, title, onClose, onPlay }) {
     setLoading(true); setError('');
     try {
       const data = await api.get(`${base}?offset=${offset}`);
+      setFolder(data.saveDirectory || ''); importRequest.current = null;
       setHistory(previous => ({ ...data, versions: offset ? [...previous.versions, ...data.versions] : data.versions }));
     } catch (err) { setError(err.message); }
     finally { setLoading(false); }
@@ -63,7 +64,7 @@ export default function SaveHistoryModal({ gameId, title, onClose, onPlay }) {
     if (!files.length) return;
     setBusy(true); setError(''); setNotice(''); setImportPlan(null); importRequest.current = null;
     try {
-      const plan = await readSaveFolder(files, history.saveFolders?.[0] || '');
+      const plan = await readSaveFolder(files, history.saveDirectory || '');
       setImportPlan(plan); setFolder(plan.folder);
     } catch (err) { setError(err.message); }
     finally { setBusy(false); }
@@ -123,8 +124,9 @@ export default function SaveHistoryModal({ gameId, title, onClose, onPlay }) {
             <ul className="max-h-32 overflow-y-auto break-all">{importPlan.files.slice(0, 20).map((file, index) => <li key={index}>{file.token ? 'tokens/' : ''}{file.name}</li>)}</ul>
             {importPlan.files.length > 20 && <p>And {importPlan.files.length - 20} more files.</p>}
           </details>
-          <label className="block text-sm text-gray-600 dark:text-gray-300">Save folder name
-            <input value={folder} disabled={busy} onChange={event => { setFolder(event.target.value); importRequest.current = null; }} className="mt-1 w-full rounded-lg border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-800 px-3 py-2 text-gray-900 dark:text-white" />
+          {!history.saveDirectory && <p role="status" className="text-sm text-amber-700 dark:text-amber-300">{history.saveFolders?.length > 1 ? 'Several save directories were found.' : 'The game’s save directory is not known yet.'} Launch this game once, then reopen save history before importing. The selected desktop folder’s name is not used as the destination.</p>}
+          <label className="block text-sm text-gray-600 dark:text-gray-300">{history.saveDirectory ? 'Game save directory' : 'Advanced: enter a verified runtime save directory'}
+            <input value={folder} disabled={busy || Boolean(history.saveDirectory)} onChange={event => { setFolder(event.target.value); importRequest.current = null; }} className="mt-1 w-full rounded-lg border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-800 px-3 py-2 text-gray-900 dark:text-white" />
           </label>
           <p className="text-sm text-gray-600 dark:text-gray-300">Use saves from a compatible release of this game; matching game versions alone does not guarantee Ren’Py engine compatibility. Import replaces your synced slots and keeps the current version in history. Close the game first.</p>
           <p className="text-xs text-gray-500 dark:text-gray-400">Include persistent and security_keys.txt when available.</p>
@@ -162,7 +164,7 @@ export default function SaveHistoryModal({ gameId, title, onClose, onPlay }) {
       </div>
       <div className="px-6 py-4 border-t border-gray-200 dark:border-gray-800 flex flex-wrap gap-2 justify-between">
         {importPlan ? <>
-          <button disabled={busy || loading} onClick={applyImport} className="px-3 py-2 min-h-11 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-sm disabled:opacity-50">Import and use saves</button>
+          <button disabled={busy || loading || !validPath(folder)} onClick={applyImport} className="px-3 py-2 min-h-11 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-sm disabled:opacity-50">Import and use saves</button>
           <button disabled={busy} onClick={() => { setImportPlan(null); importRequest.current = null; }} className="px-3 py-2 min-h-11 rounded-lg bg-gray-100 dark:bg-gray-800 text-sm">Cancel import</button>
         </> : <>
         <button disabled={busy || loading} onClick={() => { restoreRequest.current = null; importRequest.current = null; setConfirm(null); load(); }} className="px-3 py-2 min-h-11 rounded-lg bg-gray-100 dark:bg-gray-800 text-sm disabled:opacity-50">Refresh</button>

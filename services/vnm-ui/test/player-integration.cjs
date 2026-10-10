@@ -20,6 +20,7 @@ const { createHash } = require('node:crypto');
 
 const dist = resolve(__dirname, '../dist');
 let state = { revision: 0, snapshot: null };
+let directoryKnown = true;
 const versions = [], receipts = new Map();
 const saveHash = copy => createHash('sha256').update(JSON.stringify((copy?.files || []).filter(file => file.path.endsWith('.save'))
   .map(file => [file.path, file.data]).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0))).digest('hex');
@@ -65,7 +66,9 @@ const server = createServer(async (request, response) => {
   if (url.pathname === '/api/v1/library') return json([game]);
   if (url.pathname === '/api/v1/library/X') return json(game);
   if (url.pathname === '/api/v1/games/X/saves/history') return json({ currentRevision: state.revision,
-    currentVersionId: state.currentVersionId, saveFolders: ['game'], versions: versions.map(({ snapshot, ...metadata }) => metadata), nextOffset: null });
+    currentVersionId: state.currentVersionId, saveFolders: directoryKnown ? ['game'] : [],
+    saveDirectory: directoryKnown ? 'game' : null, saveDirectorySource: directoryKnown ? 'build' : null,
+    versions: versions.map(({ snapshot, ...metadata }) => metadata), nextOffset: null });
   if (url.pathname === '/api/v1/games/X/saves/history/import') {
     let body = ''; for await (const chunk of request) body += chunk;
     const imported = JSON.parse(body);
@@ -234,7 +237,8 @@ const server = createServer(async (request, response) => {
       { name: 'log.txt', mimeType: 'text/plain', buffer: Buffer.from('ignored') },
     ]);
     await history.getByRole('button', { name: 'Import and use saves', exact: true }).waitFor();
-    assert.equal(await history.getByLabel('Save folder name').inputValue(), 'game');
+    assert.equal(await history.getByLabel('Game save directory', { exact: true }).inputValue(), 'game');
+    assert.equal(await history.getByLabel('Game save directory', { exact: true }).isDisabled(), true);
     assert.equal(state.revision, 5, 'Selecting files must not change server saves before confirmation');
     if (process.env.SCREENSHOT_PATH) await page.screenshot({ path: process.env.SCREENSHOT_PATH });
     await history.getByRole('button', { name: 'Import and use saves', exact: true }).click();
@@ -246,7 +250,23 @@ const server = createServer(async (request, response) => {
     await history.getByRole('button', { name: 'Download', exact: true }).first().click();
     const importedZip = zipFiles(readFileSync(await (await importDownload).path()));
     assert.equal(importedZip.get('game/1.save').toString(), 'imported desktop save');
+    directoryKnown = false;
+    await history.getByRole('button', { name: 'Refresh', exact: true }).click();
+    await page.waitForFunction(() => [...document.querySelectorAll('[data-save-history-dialog] button')]
+      .some(button => button.textContent === 'Import save folder' && !button.disabled));
+    await history.getByLabel('Save files', { exact: true }).setInputFiles([
+      { name: 'renamed.save', mimeType: 'application/octet-stream', buffer: Buffer.from('another save') },
+    ]);
+    const unknown = history.getByLabel('Advanced: enter a verified runtime save directory', { exact: true });
+    await unknown.waitFor();
+    assert.equal(await unknown.inputValue(), '');
+    assert.equal(await history.getByRole('button', { name: 'Import and use saves', exact: true }).isDisabled(), true);
+    await history.getByText(/The game’s save directory is not known yet/).waitFor();
+    await unknown.fill('VerifiedGame');
+    assert.equal(await history.getByRole('button', { name: 'Import and use saves', exact: true }).isEnabled(), true);
+    await history.getByRole('button', { name: 'Cancel import', exact: true }).click();
+    assert.equal(state.revision, 6, 'An unknown destination never silently imports to a guessed folder');
     assert.deepEqual(errors, []);
-    console.log('PASS: both launchers export ZIP files, restore personal history, fit mobile, and confirm imports before replacing saves');
+    console.log('PASS: both launchers export/restore saves, fit mobile, protect known destinations, and require a verified unknown destination');
   } finally { if (browser) await browser.close(); server.close(); }
 })().catch(error => { console.error(error); process.exitCode = 1; });
