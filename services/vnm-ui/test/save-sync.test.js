@@ -12,7 +12,7 @@ const saveHash = copy => createHash('sha256').update(JSON.stringify((copy?.files
   .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0))).digest('hex');
 
 // Model the IDBFS populate/flush boundary rather than Ren'Py save semantics.
-function browser(server, databases, { user = 'A', game = 'X', metadata = new Map(), choices = [], savedir } = {}) {
+function browser(server, databases, { user = 'A', game = 'X', metadata = new Map(), choices = [], savedir, buildVersion = null } = {}) {
   server.receipts ||= new Map(); server.alternates ||= [];
   server.uploads ||= [];
   const files = new Map(); const dirs = new Set([root]); const statuses = [];
@@ -46,7 +46,7 @@ function browser(server, databases, { user = 'A', game = 'X', metadata = new Map
     }),
   };
   const context = {
-    location: { search: `?vnmGame=${game}&vnmUser=${user}`, origin: 'https://vnm.test' },
+    location: { search: `?vnmGame=${game}&vnmUser=${user}&vnmBuild=${encodeURIComponent(buildVersion || '')}`, origin: 'https://vnm.test' },
     URLSearchParams, Uint8Array, AbortSignal, console, setTimeout, clearTimeout,
     atob: s => Buffer.from(s, 'base64').toString('binary'), btoa: s => { encodings++; return Buffer.from(s, 'binary').toString('base64'); },
     localStorage: { getItem: key => metadata.get(key) ?? null, setItem: (key, value) => metadata.set(key, value) },
@@ -103,7 +103,8 @@ function browser(server, databases, { user = 'A', game = 'X', metadata = new Map
       const state = server.get(key) || { revision: 0, snapshot: null };
       if (options.method === 'GET') {
         const id = new URLSearchParams(url.split('?')[1] || '').get('uploadId');
-        return { ok: true, status: 200, json: async () => ({ ...state, deltaUploads: server.deltaUploads !== false, saveChecksum: saveHash(state.snapshot),
+        return { ok: true, status: 200, json: async () => ({ saveDirectory: server.directories?.get(key) || null, saveBuildVersion: server.buildVersion || null,
+          ...state, deltaUploads: server.deltaUploads !== false, saveChecksum: saveHash(state.snapshot),
           acknowledgement: server.receipts.get(`${key}:${id}`)?.response || null }) };
       }
       const body = JSON.parse(options.body);
@@ -143,12 +144,13 @@ function browser(server, databases, { user = 'A', game = 'X', metadata = new Map
     },
   };
   const buttons = [];
+  const prompts = [];
   context.document.createElement = tag => ({ style: {}, append(child) { if (child.tag === 'button') buttons.push(child); }, remove() {}, tag });
-  context.document.body.append = () => { const index = choices.shift() ?? 0; queueMicrotask(() => buttons.splice(0)[index].onclick()); };
+  context.document.body.append = () => { prompts.push(buttons.map(button => button.textContent)); const index = choices.shift() ?? 0; queueMicrotask(() => buttons.splice(0)[index].onclick()); };
   context.window = context;
   vm.createContext(context); vm.runInContext(source, context);
   return {
-    fs, statuses, events, metadata, namespace, backups,
+    fs, statuses, events, metadata, namespace, backups, prompts,
     encodedCount: () => encodings,
     offline: value => { offline = value; },
     pauseNextUpload() { let release; nextUploadGate = new Promise(resolve => { release = resolve; }); return release; },
@@ -226,12 +228,14 @@ test('competing sessions preserve the rejected browser copy', async () => {
 
 test('explicit legacy import copies only the selected game plus signing keys', async () => {
   const server = new Map(), databases = new Map();
+  server.directories = new Map([['A:X', 'old-game']]);
   databases.set(root, { files: new Map([
     [`${root}/old-game/1.save`, { bytes: Buffer.from('legacy'), mtime: 1000 }],
     [`${root}/other-game/1.save`, { bytes: Buffer.from('other'), mtime: 1000 }],
     [`${root}/tokens/security_keys.txt`, { bytes: Buffer.from('keys'), mtime: 1000 }],
   ]) });
   const a = browser(server, databases, { choices: [1] }); await a.start();
+  assert.deepEqual(a.prompts, [['Start without importing', 'Import old-game']]);
   const files = server.get('A:X').snapshot.files;
   assert.deepEqual(files.map(f => f.path).sort(), ['old-game/1.save', 'tokens/security_keys.txt']);
   assert.equal(databases.get(root).files.size, 3);
@@ -239,8 +243,35 @@ test('explicit legacy import copies only the selected game plus signing keys', a
 
 test('declining legacy import leaves original saves untouched', async () => {
   const databases = new Map([[root, { files: new Map([[`${root}/old/1.save`, { bytes: Buffer.from('legacy'), mtime: 1 }]]) }]]);
-  const server = new Map(); const a = browser(server, databases); await a.start();
+  const server = new Map(); server.directories = new Map([['A:X', 'old']]);
+  const a = browser(server, databases); await a.start();
+  assert.equal(a.prompts.length, 1);
   assert.equal(server.size, 0); assert.equal(databases.get(root).files.size, 1);
+});
+
+test('legacy migration skips unrelated, unknown, and stale-build directories', async () => {
+  for (const [directory, buildVersion] of [['Lewd Town Adventures', null], [null, null], ['Abnormal-1686524459', 'new-build']]) {
+    const server = new Map(); server.directories = new Map([['A:X', directory]]); server.buildVersion = buildVersion;
+    const databases = new Map([[root, { files: new Map([
+      [`${root}/Abnormal-1686524459/1.save`, { bytes: Buffer.from('other game'), mtime: 1 }],
+    ]) }]]);
+    const a = browser(server, databases, { choices: [1] }); await a.start();
+    assert.deepEqual(a.prompts, []); assert.equal(server.uploads.length, 0);
+    assert.equal(databases.get(root).files.size, 1);
+  }
+});
+
+test('legacy migration matches nested directory paths exactly', async () => {
+  const server = new Map(); server.directories = new Map([['A:X', 'Games/Abnormal']]);
+  const databases = new Map([[root, { files: new Map([
+    [`${root}/Games/Abnormal/1.save`, { bytes: Buffer.from('matching'), mtime: 1 }],
+    [`${root}/Games/Abnormal-other/1.save`, { bytes: Buffer.from('unrelated'), mtime: 1 }],
+    [`${root}/Games/Lewd Town/persistent`, { bytes: Buffer.from('unrelated'), mtime: 1 }],
+  ]) }]]);
+  const a = browser(server, databases, { choices: [1] }); await a.start();
+  assert.deepEqual(a.prompts, [['Start without importing', 'Import Games/Abnormal']]);
+  assert.deepEqual(server.get('A:X').snapshot.files.map(file => file.path), ['Games/Abnormal/1.save']);
+  assert.equal(databases.get(root).files.size, 3);
 });
 
 test('startup preserves offline progress as an alternate and loads synced saves without a prompt', async () => {

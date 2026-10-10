@@ -96,6 +96,10 @@ test('SQLite migration and authenticated per-user/game revision API', async t =>
       assert.equal(known.saveDirectory, 'test'); assert.equal(known.saveDirectorySource, 'runtime');
       assert.equal(known.currentRevision, 0); assert.deepEqual(known.versions, []);
       assert.equal((await get('A')).json().snapshot, null);
+      assert.equal((await get('A')).json().saveDirectory, 'test');
+      assert.equal((await get('A')).json().saveBuildVersion, null);
+      assert.equal((await get('B')).json().saveDirectory, null);
+      assert.equal((await get('A', 'Y')).json().saveDirectory, null);
       assert.equal((await history('B')).json().saveDirectory, null);
       assert.equal((await history('A', 'Y')).json().saveDirectory, null);
       const persistent = { version: 1, files: ['Game/persistent', 'Game/sync/persistent', 'tokens/security_keys.txt']
@@ -126,6 +130,10 @@ test('SQLite migration and authenticated per-user/game revision API', async t =>
       const ready = (await history()).json();
       assert.equal(ready.currentRevision, 0); assert.deepEqual(ready.versions, []);
       assert.equal(ready.saveDirectory, 'BuiltGame'); assert.equal(ready.saveDirectorySource, 'build');
+      const launch = (await get('A', 'Y')).json();
+      assert.equal(launch.saveDirectory, 'BuiltGame');
+      assert.equal(launch.saveBuildVersion, (await prisma.game.findUnique({ where: { id: 'Y' }, select: { builtAt: true } })).builtAt.toISOString());
+      assert.equal((await get('B', 'Y')).json().saveDirectory, 'BuiltGame');
       const stale = await app.inject({ method: 'POST', url: '/api/v1/games/Y/saves/directory', headers: { authorization: 'A' },
         payload: { directory: 'OldBuild', buildVersion: null } });
       assert.equal(stale.statusCode, 409);
@@ -139,6 +147,8 @@ test('SQLite migration and authenticated per-user/game revision API', async t =>
       await runtime('RuntimeOverride');
       assert.equal((await history()).json().saveDirectorySource, 'runtime');
       assert.equal((await history()).json().saveDirectory, 'RuntimeOverride');
+      assert.equal((await get('A', 'Y')).json().saveDirectory, 'RuntimeOverride');
+      assert.equal((await get('B', 'Y')).json().saveDirectory, 'BuiltGame');
       await callback({ status: 'failed' });
       assert.equal((await history()).json().saveDirectory, 'RuntimeOverride');
       await callback({ status: 'done', saveDirectory: null });

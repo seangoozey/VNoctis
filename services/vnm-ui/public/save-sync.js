@@ -188,7 +188,8 @@
       };
     });
   }
-  // Choices are explicit; never guess which game's legacy directory belongs here.
+  // Legacy storage has no account owner. Offer only this game's verified path;
+  // importing is explicit and leaves the original shared browser copy intact.
   function choose(message, options) {
     return new Promise(resolve => {
       const panel = document.createElement('div');
@@ -208,7 +209,10 @@
       document.body.append(panel);
     });
   }
-  async function legacyCopy() {
+  async function legacyCopy(directory) {
+    if (typeof directory !== 'string' || !directory || directory.length > 400 ||
+        /[\\:\x00-\x1f]/.test(directory) || directory.split('/').some(part => !part || part === '.' || part === '..') ||
+        directory.split('/')[0] === 'tokens') return null;
     const db = await new Promise((resolve, reject) => originalGetDB(root, (err, db) => err ? reject(err) : resolve(db)));
     const entries = await new Promise((resolve, reject) => {
       const tx = db.transaction('FILE_DATA', 'readonly');
@@ -216,11 +220,11 @@
       req.onsuccess = () => { const c = req.result; if (c) { list.push([c.key, c.value]); c.continue(); } };
       tx.oncomplete = () => resolve(list); tx.onabort = () => reject(tx.error);
     });
-    const folders = [...new Set(entries.filter(([path, entry]) => path.startsWith(`${root}/`) && entry.contents)
-      .map(([path]) => path.slice(root.length + 1).split('/')[0]))].filter(n => n !== 'tokens');
-    if (!folders.length) return null;
-    const folder = await choose('Existing browser saves found. Select this game’s save folder to import a copy. The original stays untouched.',
-      [['Start without importing', null], ...folders.map(n => [`Import ${n}`, n])]);
+    const prefix = `${root}/${directory}/`;
+    if (!entries.some(([path, entry]) => entry.contents && path.startsWith(prefix) &&
+        (path.endsWith('.save') || path === `${prefix}persistent`))) return null;
+    const folder = await choose('Existing browser saves found for this game. Import a copy into your account? The original stays untouched.',
+      [['Start without importing', null], [`Import ${directory}`, directory]]);
     if (!folder) return null;
     return { version: 1, files: entries.filter(([path, entry]) => entry.contents &&
       (path.startsWith(`${root}/${folder}/`) || path.startsWith(`${root}/tokens/`))).map(([path, entry]) => {
@@ -254,7 +258,7 @@
         remote = await api('GET');
       }
       if (!remote.snapshot && !local.files.length) {
-        const legacy = await legacyCopy();
+        const legacy = await legacyCopy(remote.saveBuildVersion === (params.get('vnmBuild') || null) ? remote.saveDirectory : null);
         if (legacy) { local = legacy; restore(local); await flush(); meta.dirty = true; remember(); }
       }
       const knownBaseline = acknowledgedSlots?.revision === meta.revision;

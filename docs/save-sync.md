@@ -99,10 +99,16 @@ check precede save access.
 An existing isolated local tree with no server record imports automatically.
 Legacy IDBFS storage has no user/game ownership information, so it is never
 silently assigned. On first use without either a server or isolated local copy,
-the startup prompt lists legacy save directories. Select this game's directory
-to copy it and token files, or continue without importing. The legacy database
-stays untouched. On shared browsers, import only saves you own. Selecting the
-wrong folder cannot be detected automatically.
+the startup prompt offers only the current game's verified save directory when
+matching legacy saves exist. It uses runtime or build metadata for the current
+build, matches the complete directory path, and never lists unrelated games.
+Choose to copy that directory and token files, or continue without importing.
+Unknown directories proceed without a prompt; rebuilding captures eligible
+settings before launch. Runtime metadata from a previous launch can also identify
+the destination. The legacy database stays untouched. This convenience assumes the usual
+single-user deployment: legacy data has no account ownership, so a matching
+directory cannot establish who created it. On shared browsers, import only saves
+you own.
 
 Offline edits keep their last acknowledged server revision and a dirty flag.
 Browser filesystem writes remain immediate. Written or atomically renamed

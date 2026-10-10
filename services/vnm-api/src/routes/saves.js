@@ -92,12 +92,16 @@ export default async function savesRoutes(fastify) {
         userId_gameId: { userId: request.user.userId, gameId: request.params.gameId },
       } });
       const key = { userId: request.user.userId, gameId: request.params.gameId };
+      const runtime = await tx.saveRuntimeDirectory.findUnique({ where: { userId_gameId: key } });
+      const game = await tx.game.findUnique({ where: { id: key.gameId }, select: { webSaveDirectory: true, builtAt: true } });
       const acknowledgement = request.query.uploadId ? await tx.saveUploadReceipt.findUnique({ where: {
         userId_gameId_uploadId: { ...key, uploadId: request.query.uploadId },
       } }) : null;
       const snapshot = state ? await readCurrent(tx, state) : null;
       return { revision: state?.revision || 0, checksum: state?.checksum, uploadId: state?.uploadId,
         deltaUploads: true,
+        saveDirectory: runtime?.directory || game?.webSaveDirectory || null,
+        saveBuildVersion: game?.builtAt?.toISOString() || null,
         currentVersionId: state?.currentVersionId, snapshot, saveChecksum: saveChecksum(snapshot || { files: [] }),
         acknowledgement: acknowledgement ? receiptResponse(acknowledgement, state?.revision || 0) : null };
     });
