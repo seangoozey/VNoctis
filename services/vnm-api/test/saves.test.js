@@ -7,6 +7,7 @@ import Fastify from 'fastify';
 import { PrismaClient } from '@prisma/client';
 import savesRoutes, { validateDelta, validateSnapshot } from '../src/routes/saves.js';
 import { readCurrent } from '../src/services/saveHistory.js';
+import internalRoutes from '../src/routes/internal.js';
 
 const snapshot = (data = 'device A') => ({ version: 1, files: [
   { path: 'test/1-1-LT1.save', mtime: 1000, data: Buffer.from(data).toString('base64') },
@@ -78,8 +79,86 @@ test('SQLite migration and authenticated per-user/game revision API', async t =>
       request.user = { userId };
     });
     await app.register(savesRoutes, { prefix: '/api/v1' });
+    await app.register(internalRoutes, { prefix: '/api/v1' });
     const get = (user, game = 'X') => app.inject({ method: 'GET', url: `/api/v1/games/${game}/saves`, headers: { authorization: user } });
     const put = (user, revision, copy = snapshot(), game = 'X') => app.inject({ method: 'PUT', url: `/api/v1/games/${game}/saves`, headers: { authorization: user }, payload: { revision, snapshot: copy, userId: 'B' } });
+    await t.test('runtime destination survives a launch without creating saves and stays scoped', async () => {
+      const report = (user, directory, game = 'X') => app.inject({ method: 'POST', url: `/api/v1/games/${game}/saves/directory`,
+        headers: { authorization: user }, payload: { directory, userId: 'B' } });
+      const history = (user, game = 'X') => app.inject({ method: 'GET', url: `/api/v1/games/${game}/saves/history`, headers: { authorization: user } });
+      for (const directory of ['', '../Game', '/Game', 'tokens', 'Game//saves', 'C:/saves', 'Game\\saves', 'x'.repeat(401)]) {
+        assert.equal((await report('A', directory)).statusCode, 400);
+      }
+      assert.equal((await report('missing', 'test')).statusCode, 401);
+      assert.equal((await report('A', 'test', 'absent')).statusCode, 404);
+      assert.equal((await report('A', 'test')).statusCode, 200);
+      const known = (await history('A')).json();
+      assert.equal(known.saveDirectory, 'test'); assert.equal(known.saveDirectorySource, 'runtime');
+      assert.equal(known.currentRevision, 0); assert.deepEqual(known.versions, []);
+      assert.equal((await get('A')).json().snapshot, null);
+      assert.equal((await get('A')).json().saveDirectory, 'test');
+      assert.equal((await get('A')).json().saveBuildVersion, null);
+      assert.equal((await get('B')).json().saveDirectory, null);
+      assert.equal((await get('A', 'Y')).json().saveDirectory, null);
+      assert.equal((await history('B')).json().saveDirectory, null);
+      assert.equal((await history('A', 'Y')).json().saveDirectory, null);
+      const persistent = { version: 1, files: ['Game/persistent', 'Game/sync/persistent', 'tokens/security_keys.txt']
+        .map(path => ({ path, mtime: 1, data: 'AA==' })) };
+      assert.equal((await put('B', 0, persistent, 'Y')).statusCode, 200);
+      assert.equal((await history('B', 'Y')).json().saveDirectory, 'Game');
+      persistent.files.push({ path: 'Other/persistent', mtime: 1, data: 'AA==' });
+      assert.equal((await put('B', 1, persistent, 'Y')).statusCode, 200);
+      const ambiguous = (await history('B', 'Y')).json();
+      assert.equal(ambiguous.saveDirectory, null); assert.deepEqual(ambiguous.saveFolders, ['Game', 'Other']);
+      await prisma.saveSyncState.deleteMany({ where: { userId: 'B', gameId: 'Y' } });
+      await prisma.saveVersion.deleteMany({ where: { userId: 'B', gameId: 'Y' } });
+      await prisma.saveUploadReceipt.deleteMany({ where: { userId: 'B', gameId: 'Y' } });
+    });
+    await t.test('successful builds enable imports before play and invalidate old runtime destinations', async () => {
+      const history = () => app.inject({ method: 'GET', url: '/api/v1/games/Y/saves/history', headers: { authorization: 'A' } });
+      const runtime = async directory => {
+        const game = await prisma.game.findUnique({ where: { id: 'Y' }, select: { builtAt: true } });
+        return app.inject({ method: 'POST', url: '/api/v1/games/Y/saves/directory', headers: { authorization: 'A' },
+          payload: { directory, buildVersion: game.builtAt?.toISOString() || null } });
+      };
+      const job = await prisma.buildJob.create({ data: { gameId: 'Y' } });
+      const callback = body => app.inject({ method: 'POST', url: `/api/v1/internal/build/${job.id}/status`, headers: { authorization: 'A' }, payload: body });
+      await runtime('OldBuild');
+      assert.equal((await callback({ status: 'done', saveDirectory: '../bad' })).statusCode, 400);
+      assert.equal((await history()).json().saveDirectory, 'OldBuild');
+      assert.equal((await callback({ status: 'done', webBuildPath: '/web-builds/Y', saveDirectory: 'BuiltGame' })).statusCode, 200);
+      const ready = (await history()).json();
+      assert.equal(ready.currentRevision, 0); assert.deepEqual(ready.versions, []);
+      assert.equal(ready.saveDirectory, 'BuiltGame'); assert.equal(ready.saveDirectorySource, 'build');
+      const launch = (await get('A', 'Y')).json();
+      assert.equal(launch.saveDirectory, 'BuiltGame');
+      assert.equal(launch.saveBuildVersion, (await prisma.game.findUnique({ where: { id: 'Y' }, select: { builtAt: true } })).builtAt.toISOString());
+      assert.equal((await get('B', 'Y')).json().saveDirectory, 'BuiltGame');
+      const stale = await app.inject({ method: 'POST', url: '/api/v1/games/Y/saves/directory', headers: { authorization: 'A' },
+        payload: { directory: 'OldBuild', buildVersion: null } });
+      assert.equal(stale.statusCode, 409);
+      assert.equal((await history()).json().saveDirectory, 'BuiltGame');
+      const copy = { version: 1, files: [{ path: 'BuiltGame/1.save', mtime: 1, data: 'AA==' }] };
+      const upload = snapshot => app.inject({ method: 'POST', url: '/api/v1/games/Y/saves/history/import', headers: { authorization: 'A' },
+        payload: { revision: 0, uploadId: 'before-first-launch', snapshot } });
+      assert.equal((await upload({ ...copy, files: [{ ...copy.files[0], path: 'saves/1.save' }] })).statusCode, 409);
+      assert.equal((await upload(copy)).statusCode, 200);
+      assert.deepEqual((await get('A', 'Y')).json().snapshot, copy);
+      await runtime('RuntimeOverride');
+      assert.equal((await history()).json().saveDirectorySource, 'runtime');
+      assert.equal((await history()).json().saveDirectory, 'RuntimeOverride');
+      assert.equal((await get('A', 'Y')).json().saveDirectory, 'RuntimeOverride');
+      assert.equal((await get('B', 'Y')).json().saveDirectory, 'BuiltGame');
+      await callback({ status: 'failed' });
+      assert.equal((await history()).json().saveDirectory, 'RuntimeOverride');
+      await callback({ status: 'done', saveDirectory: null });
+      assert.equal((await history()).json().saveDirectorySource, null);
+      assert.equal((await history()).json().saveDirectory, null, 'Old snapshots cannot establish a rebuilt game’s new destination');
+      assert.deepEqual((await get('A', 'Y')).json().snapshot, copy);
+      await prisma.saveSyncState.deleteMany({ where: { userId: 'A', gameId: 'Y' } });
+      await prisma.saveVersion.deleteMany({ where: { userId: 'A', gameId: 'Y' } });
+      await prisma.saveUploadReceipt.deleteMany({ where: { userId: 'A', gameId: 'Y' } });
+    });
     await t.test('first browser upload is visible to another session of the same user', async () => {
       assert.equal((await put('A', 0)).statusCode, 200);
       const response = await get('A'); assert.equal(response.json().revision, 1);

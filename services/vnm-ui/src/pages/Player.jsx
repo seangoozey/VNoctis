@@ -388,7 +388,7 @@ export default function Player() {
           <>
             <iframe
               ref={iframeRef}
-              src={`${cacheLaunch.src}${cacheLaunch.src.includes('?') ? '&' : '?'}vnmGame=${encodeURIComponent(gameId)}&vnmUser=${encodeURIComponent(user?.userId || '')}&vnmBridge=${__SAVE_SYNC_VERSION__}`}
+              src={`${cacheLaunch.src}${cacheLaunch.src.includes('?') ? '&' : '?'}vnmGame=${encodeURIComponent(gameId)}&vnmUser=${encodeURIComponent(user?.userId || '')}&vnmBuild=${encodeURIComponent(game.builtAt || '')}&vnmBridge=${__SAVE_SYNC_VERSION__}`}
               title={title}
               sandbox="allow-scripts allow-same-origin allow-popups allow-forms allow-downloads"
               allow="autoplay; fullscreen"

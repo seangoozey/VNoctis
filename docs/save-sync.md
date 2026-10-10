@@ -99,10 +99,16 @@ check precede save access.
 An existing isolated local tree with no server record imports automatically.
 Legacy IDBFS storage has no user/game ownership information, so it is never
 silently assigned. On first use without either a server or isolated local copy,
-the startup prompt lists legacy save directories. Select this game's directory
-to copy it and token files, or continue without importing. The legacy database
-stays untouched. On shared browsers, import only saves you own. Selecting the
-wrong folder cannot be detected automatically.
+the startup prompt offers only the current game's verified save directory when
+matching legacy saves exist. It uses runtime or build metadata for the current
+build, matches the complete directory path, and never lists unrelated games.
+Choose to copy that directory and token files, or continue without importing.
+Unknown directories proceed without a prompt; rebuilding captures eligible
+settings before launch. Runtime metadata from a previous launch can also identify
+the destination. The legacy database stays untouched. This convenience assumes the usual
+single-user deployment: legacy data has no account ownership, so a matching
+directory cannot establish who created it. On shared browsers, import only saves
+you own.
 
 Offline edits keep their last acknowledged server revision and a dirty flag.
 Browser filesystem writes remain immediate. Written or atomically renamed
@@ -165,7 +171,7 @@ be explicitly deleted.
 **Import save folder** selects one game's native save folder. **Choose files
 instead** supports browsers without folder selection and lets users include
 `persistent` and `security_keys.txt` alongside `.save` files. The preview maps
-them to the existing web save folder (editable when necessary), lists selected
+them to the game's known web save directory, lists selected
 files, and reports skipped unrelated files. Import requires confirmation and a
 matching live revision, backs up exact prior progress, creates an `imported`
 history version, and replaces live slots for the next launch. Existing signing
@@ -173,6 +179,38 @@ keys are retained if none were supplied. Repeated requests reuse an upload
 receipt. Paths, file count, file types and aggregate size are validated;
 compatibility with the chosen game/version is the user's responsibility.
 Imports and explicit restores share the last-40 manual version retention.
+
+After startup the bridge reads `config.savedir` from the running engine and
+records its path relative to `/home/web_user/.renpy`, separately for each user
+and game. This does not create a save or a history entry, and retries after an
+offline launch. Existing snapshots with only `persistent` can also identify a
+single destination; a `sync` mirror is excluded when its parent is present.
+The selected desktop folder's name is never used to guess the web destination.
+For an unknown or ambiguous directory, launch the game once and reopen history.
+An advanced manual entry remains available for a verified runtime directory.
+Known destinations are read-only, and imports are rejected if the recorded
+runtime directory changed after the preview. Saves go directly in the configured
+directory; no extra `saves/` suffix is added. Directories outside the bridge's
+mounted root are not recorded automatically.
+
+New web builds also capture a single top-level literal `config.save_directory`
+declaration using the SDK's existing initialized build reflection pass. The
+capture requires the effective setting to match the literal and the default
+save-path resolver. Computed, conditional, multiple, custom-path, or unavailable
+source declarations remain unknown and use runtime detection. A temporary build
+hook and its JSON output are excluded from the distribution; all build modes use
+an overlay with writable scripts/progressive rules copied away from source links.
+The successful build callback stores the directory on the game, making it
+available to every user's import preview before first play. Existing builds need
+rebuilding to obtain this metadata; runtime and snapshot fallbacks still work.
+
+Runtime metadata takes priority over build metadata. Successful rebuilds clear
+old runtime reports, and new reports must match the player's build timestamp.
+Stale open tabs cannot replace the new metadata; rejecting their directory report
+does not pause their save uploads. Snapshots predating a rebuild are not evidence
+of its new destination, and refreshing an unknown destination clears the previous
+folder field. First-launch restores create directories and
+write imported files before Ren'Py continues startup and scans its save slots.
 
 History is outside Ren'Py's mounted filesystem. The engine's rotating ten
 autosave slots and original filenames are unchanged. A historical restore
@@ -264,6 +302,9 @@ operation, not a sandbox against malicious game JavaScript.
 ## Validation
 
 Run `npm test` in each service and `npm run build` in `services/vnm-ui`.
+Builder metadata tests run on Linux with `python -m unittest discover -s test -v`
+in `services/vnm-builder`; they verify literal detection, conservative fallback,
+source protection, reserved filenames, and distribution exclusions.
 Run `npm run test:player` in the UI for the built React player plus bridge test
 in mobile-sized Chromium. It verifies that the startup toast disappears,
 persistent-only uploads stay quiet, consecutive save acknowledgements become

@@ -217,6 +217,12 @@ test('deduplicated server history restores rotating RenPy slots without adding f
       const priorCount = await prisma.saveVersion.count({ where: { userId: 'B', gameId: 'Y' } });
       const snapshot = { version: 1, files: [{ path: 'game/1.save', mtime: 1234, data: encoded('imported native progress') }] };
       const body = { revision: before.revision, uploadId: 'folder-import', snapshot };
+      assert.equal((await ownCall('POST', '/directory', { directory: 'game' })).statusCode, 200);
+      const wrongDestination = await ownCall('POST', '/history/import', { ...body, snapshot: { version: 1,
+        files: [{ ...snapshot.files[0], path: 'saves/1.save' }] } });
+      assert.equal(wrongDestination.statusCode, 409);
+      assert.deepEqual((await ownCall('GET', '')).json().snapshot, before.snapshot);
+      assert.equal(await prisma.saveVersion.count({ where: { userId: 'B', gameId: 'Y' } }), priorCount);
       assert.equal((await ownCall('POST', '/history/import', { ...body, revision: 0 })).statusCode, 409);
       const imported = await ownCall('POST', '/history/import', body);
       assert.equal(imported.statusCode, 200, imported.body);
@@ -228,6 +234,8 @@ test('deduplicated server history restores rotating RenPy slots without adding f
         before.snapshot.files.find(file => file.path === 'tokens/security_keys.txt').data);
       const version = await prisma.saveVersion.findUnique({ where: { id: imported.json().versionId } });
       assert.equal(version.kind, 'imported');
+      // A lost response is still acknowledged after a runtime-directory change.
+      await ownCall('POST', '/directory', { directory: 'changed-game' });
       assert.equal((await ownCall('POST', '/history/import', body)).json().versionId, version.id);
       assert.equal(await prisma.saveVersion.count({ where: { userId: 'B', gameId: 'Y' } }), priorCount + 1);
       assert.equal((await call('GET', `/history/${version.id}`, undefined, 'A', 'Y')).statusCode, 404);

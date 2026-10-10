@@ -14,6 +14,7 @@ from compressor import create_compressed_overlay, cleanup_overlay
 from compatibility import (
     create_uncompressed_overlay, needs_legacy_image_lookup, prepare_build_overlay,
 )
+from save_metadata import prepare_save_metadata, read_save_metadata
 from logger import setup_logger
 
 logger = setup_logger("vnm-builder.builder")
@@ -278,29 +279,30 @@ class RenPyBuilder:
                 except Exception as comp_exc:
                     await _log(
                         f"[vnm-builder] ⚠️ Image compression failed: {comp_exc} "
-                        f"— building an uncompressed overlay"
+                        f"— building uncompressed in a temporary overlay"
                     )
                     logger.warning(
                         "Compression failed job=%s: %s — proceeding uncompressed",
                         job_id, comp_exc,
                     )
-                    build_source = game_path
+                    await asyncio.to_thread(create_uncompressed_overlay, game_path, str(overlay_dir))
+                    build_source = str(overlay_dir)
             else:
                 await _log("[vnm-builder] Asset compression skipped (user opted out)")
-
-            # Always build from an overlay, including compression failures.
-            # Compatibility scripts and SDK-generated files belong to the build.
-            if build_source == game_path:
-                await asyncio.to_thread(
-                    create_uncompressed_overlay, game_path, str(overlay_dir),
-                )
+                await asyncio.to_thread(create_uncompressed_overlay, game_path, str(overlay_dir))
                 build_source = str(overlay_dir)
+
+            # Both compatibility and metadata hooks share the same disposable
+            # overlay in every build mode; neither writes to imported sources.
             legacy_image_lookup = await asyncio.to_thread(needs_legacy_image_lookup, game_path)
             await asyncio.to_thread(prepare_build_overlay, build_source, legacy_image_lookup)
             if legacy_image_lookup:
                 await _log(
                     "[vnm-builder] Compatibility: preserving native images/ asset lookup fallback"
                 )
+
+            metadata_file = await asyncio.to_thread(prepare_save_metadata, build_source)
+            env["VNM_SAVE_METADATA"] = str(metadata_file)
 
             # ── Write progressive_download.txt for web build ──
             prog_dl = Path(build_source) / "progressive_download.txt"
@@ -388,6 +390,7 @@ class RenPyBuilder:
                 job_id,
                 "done",
                 web_build_path=web_build_path,
+                save_directory=read_save_metadata(metadata_file),
             )
             await _log(
                 f"[vnm-builder] ✅ Web build successful! Output at: {output_dir} "
@@ -488,6 +491,7 @@ class RenPyBuilder:
         *,
         error: str | None = None,
         web_build_path: str | None = None,
+        save_directory: str | None = None,
     ):
         """POST a status update back to vnm-api's internal endpoint."""
         url = f"{self.api_url}/api/v1/internal/build/{job_id}/status"
@@ -496,6 +500,8 @@ class RenPyBuilder:
             payload["error"] = error
         if web_build_path is not None:
             payload["webBuildPath"] = web_build_path
+        if status == "done":
+            payload["saveDirectory"] = save_directory
 
         try:
             async with httpx.AsyncClient(timeout=10) as client:

@@ -68,18 +68,40 @@ export default async function savesRoutes(fastify) {
       reply.header('Cache-Control', 'no-store');
     },
   };
+  fastify.post('/games/:gameId/saves/directory', options, async (request, reply) => {
+    const { directory, buildVersion = null } = request.body || {};
+    if (typeof directory !== 'string' || directory.length > 400 ||
+        /[\\:\x00-\x1f]/.test(directory) || directory.split('/').some(part => !part || part === '.' || part === '..') ||
+        directory.split('/')[0] === 'tokens' ||
+        (buildVersion !== null && (typeof buildVersion !== 'string' || buildVersion.length > 40))) {
+      return reply.code(400).send({ message: 'Invalid runtime save directory.' });
+    }
+    const key = { userId: request.user.userId, gameId: request.params.gameId };
+    const accepted = await writeTransaction(fastify.prisma, async tx => {
+      const game = await tx.game.findUnique({ where: { id: key.gameId }, select: { builtAt: true } });
+      if (!game || (game.builtAt?.toISOString() || null) !== buildVersion) return false;
+      await tx.saveRuntimeDirectory.upsert({ where: { userId_gameId: key }, create: { ...key, directory }, update: { directory } });
+      return true;
+    });
+    if (!accepted) return reply.code(409).send({ code: 'SAVE_BUILD_CHANGED', message: 'Game build changed; reopen the game to identify its save directory.' });
+    return { directory };
+  });
   fastify.get('/games/:gameId/saves', options, async request => {
     return writeTransaction(fastify.prisma, async tx => {
       const state = await tx.saveSyncState.findUnique({ where: {
         userId_gameId: { userId: request.user.userId, gameId: request.params.gameId },
       } });
       const key = { userId: request.user.userId, gameId: request.params.gameId };
+      const runtime = await tx.saveRuntimeDirectory.findUnique({ where: { userId_gameId: key } });
+      const game = await tx.game.findUnique({ where: { id: key.gameId }, select: { webSaveDirectory: true, builtAt: true } });
       const acknowledgement = request.query.uploadId ? await tx.saveUploadReceipt.findUnique({ where: {
         userId_gameId_uploadId: { ...key, uploadId: request.query.uploadId },
       } }) : null;
       const snapshot = state ? await readCurrent(tx, state) : null;
       return { revision: state?.revision || 0, checksum: state?.checksum, uploadId: state?.uploadId,
         deltaUploads: true,
+        saveDirectory: runtime?.directory || game?.webSaveDirectory || null,
+        saveBuildVersion: game?.builtAt?.toISOString() || null,
         currentVersionId: state?.currentVersionId, snapshot, saveChecksum: saveChecksum(snapshot || { files: [] }),
         acknowledgement: acknowledgement ? receiptResponse(acknowledgement, state?.revision || 0) : null };
     });
@@ -204,9 +226,19 @@ export default async function savesRoutes(fastify) {
       const versions = await tx.saveVersion.findMany({ where: key, orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
         skip: request.query.offset, take: 51, select: { id: true, kind: true, alternate: true, baseRevision: true,
           revision: true, deviceLabel: true, createdAt: true, byteSize: true, restoredFrom: true } });
+      const runtime = await tx.saveRuntimeDirectory.findUnique({ where: { userId_gameId: key } });
+      const game = await tx.game.findUnique({ where: { id: key.gameId }, select: { webSaveDirectory: true, builtAt: true } });
+      // Persistent data exists before the first slot is saved. The engine's sync
+      // subdirectory is a mirror, not a separate import destination.
+      const saveFolders = [...new Set((state ? JSON.parse(state.payload).files : [])
+        .filter(file => file.path.endsWith('.save') || file.path.endsWith('/persistent'))
+        .map(file => file.path.split('/').slice(0, -1).join('/'))
+        .filter(folder => folder && folder.split('/')[0] !== 'tokens'))];
+      const candidates = saveFolders.filter(folder => !saveFolders.includes(folder.replace(/\/sync$/, '')) || !folder.endsWith('/sync'));
+      const snapshotDirectory = candidates.length === 1 && (!game?.builtAt || state.updatedAt >= game.builtAt) ? candidates[0] : null;
       return { currentRevision: state?.revision || 0, currentVersionId,
-        saveFolders: [...new Set((state ? JSON.parse(state.payload).files : []).filter(file => file.path.endsWith('.save'))
-          .map(file => file.path.split('/').slice(0, -1).join('/')).filter(Boolean))],
+        saveFolders: candidates.sort(), saveDirectory: runtime?.directory || game?.webSaveDirectory || snapshotDirectory,
+        saveDirectorySource: runtime ? 'runtime' : game?.webSaveDirectory ? 'build' : snapshotDirectory ? 'snapshot' : null,
         versions: versions.slice(0, 50), nextOffset: versions.length > 50 ? request.query.offset + 50 : null };
     });
   });
@@ -225,6 +257,13 @@ export default async function savesRoutes(fastify) {
       const receipt = await tx.saveUploadReceipt.findUnique({ where: { userId_gameId_uploadId: { ...key, uploadId } } });
       if (receipt) return receipt.checksum === marker ? receiptResponse(receipt, state?.revision || 0) : { error: 'Upload ID already used for different save data.' };
       if (revision !== (state?.revision || 0)) return { error: 'Synced saves changed. Refresh history and review the import again.' };
+      const runtime = await tx.saveRuntimeDirectory.findUnique({ where: { userId_gameId: key } });
+      const game = await tx.game.findUnique({ where: { id: key.gameId }, select: { webSaveDirectory: true } });
+      const destination = runtime?.directory || game?.webSaveDirectory;
+      if (destination && snapshot.files.some(file => file.path !== 'tokens/security_keys.txt' &&
+          file.path.split('/').slice(0, -1).join('/') !== destination)) {
+        return { error: 'The game’s save directory changed. Refresh history and review the import destination.', status: 409 };
+      }
       const copy = canonical(snapshot);
       // Keep existing signing keys if the user selected just the game folder.
       // An explicitly imported key file takes precedence.

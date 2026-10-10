@@ -20,10 +20,11 @@ const { createHash } = require('node:crypto');
 
 const dist = resolve(__dirname, '../dist');
 let state = { revision: 0, snapshot: null };
+let directoryKnown = true;
 const versions = [], receipts = new Map();
 const saveHash = copy => createHash('sha256').update(JSON.stringify((copy?.files || []).filter(file => file.path.endsWith('.save'))
   .map(file => [file.path, file.data]).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0))).digest('hex');
-const game = { id: 'X', extractedTitle: 'Fixture', buildStatus: 'built', webBuildPath: '/web-builds/test',
+const game = { id: '00000000000000000000000000000001', builtAt: '2026-10-09T12:00:00.000Z', extractedTitle: 'Fixture', buildStatus: 'built', webBuildPath: '/web-builds/test',
   tags: [], screenshots: [], updatedAt: new Date().toISOString(), directoryName: 'fixture' };
 let role = 'viewer';
 let orphans = [{ userId: 'B', username: 'player', gameId: 'missing-game', gameTitle: 'Missing Game', revision: 1,
@@ -53,6 +54,7 @@ const fixture = `<!DOCTYPE html><html><head><script src="/save-sync.js"></script
 
 const server = createServer(async (request, response) => {
   const url = new URL(request.url, 'http://localhost');
+  url.pathname = url.pathname.replace(game.id, 'X');
   const json = value => { response.setHeader('Content-Type', 'application/json'); response.end(JSON.stringify(value)); };
   if (url.pathname === '/api/v1/auth/me') return json({ userId: 'A', username: 'test', role });
   if (url.pathname === '/api/v1/users') return json([]);
@@ -62,10 +64,18 @@ const server = createServer(async (request, response) => {
     return json({ version: 1, userId: 'B', gameId: 'missing-game', snapshot: { version: 1, files: [] } });
   }
   if (url.pathname === '/api/v1/health') return json({ r2Mode: false });
+  if (url.pathname === '/api/v1/games/X/cache-build') return json({ version: game.builtAt, path: game.webBuildPath, status: game.buildStatus });
+  if (url.pathname === '/game-cache-worker.js') {
+    response.setHeader('Content-Type', 'application/javascript');
+    response.setHeader('Service-Worker-Allowed', '/web-builds/.vnm-cache/');
+    return response.end(readFileSync(resolve(dist, 'game-cache-worker.js')));
+  }
   if (url.pathname === '/api/v1/library') return json([game]);
   if (url.pathname === '/api/v1/library/X') return json(game);
   if (url.pathname === '/api/v1/games/X/saves/history') return json({ currentRevision: state.revision,
-    currentVersionId: state.currentVersionId, saveFolders: ['game'], versions: versions.map(({ snapshot, ...metadata }) => metadata), nextOffset: null });
+    currentVersionId: state.currentVersionId, saveFolders: directoryKnown ? ['game'] : [],
+    saveDirectory: directoryKnown ? 'game' : null, saveDirectorySource: directoryKnown ? 'build' : null,
+    versions: versions.map(({ snapshot, ...metadata }) => metadata), nextOffset: null });
   if (url.pathname === '/api/v1/games/X/saves/history/import') {
     let body = ''; for await (const chunk of request) body += chunk;
     const imported = JSON.parse(body);
@@ -128,9 +138,12 @@ const server = createServer(async (request, response) => {
     const page = await context.newPage();
     const errors = []; page.on('pageerror', error => errors.push(error.message));
     await page.goto(`http://127.0.0.1:${server.address().port}/play/X`);
-    const toast = page.getByRole('status');
+    const toast = page.getByRole('status').filter({ has: page.getByRole('button', { name: 'Dismiss save sync notice' }) });
     await toast.waitFor({ state: 'visible' });
     await toast.waitFor({ state: 'hidden', timeout: 10000 });
+    const launch = new URL(await page.locator('iframe').getAttribute('src'), page.url());
+    assert.ok(launch.pathname.includes('/.vnm-cache/'), 'the combined player uses retained game downloads');
+    assert.equal(launch.searchParams.get('vnmBuild'), game.builtAt, 'cached launches carry current save-directory build metadata');
     const frame = page.frames().find(frame => frame.url().includes('/web-builds/'));
     const write = (name, value) => frame.evaluate(async ({ name, value }) => {
       FS.mkdirTree('/home/web_user/.renpy/game');
@@ -216,9 +229,9 @@ const server = createServer(async (request, response) => {
     await history.getByText('Version restored. Launch the game to use these saves.', { exact: true }).waitFor();
     await page.setViewportSize({ width: 812, height: 375 });
     await history.getByRole('button', { name: 'Play with restored saves', exact: true }).click();
-    await page.waitForURL('**/gallery/play/X');
+    await page.waitForURL(`**/gallery/play/${game.id}`);
     await page.waitForFunction(() => document.querySelector('iframe') !== null);
-    const restoredFrame = page.frames().find(frame => frame.url().includes('/web-builds/'));
+    const restoredFrame = await (await page.locator('iframe').elementHandle()).contentFrame();
     await restoredFrame.waitForFunction(() => document.body.dataset.ready === 'true');
     assert.deepEqual(await page.evaluate(() => [document.body.style.overflow, document.body.style.position]), ['', '']);
     assert.equal(await restoredFrame.evaluate(() => new TextDecoder().decode(FS.readFile('/home/web_user/.renpy/game/quick-1-LT1.save'))), 'quick save');
@@ -234,7 +247,8 @@ const server = createServer(async (request, response) => {
       { name: 'log.txt', mimeType: 'text/plain', buffer: Buffer.from('ignored') },
     ]);
     await history.getByRole('button', { name: 'Import and use saves', exact: true }).waitFor();
-    assert.equal(await history.getByLabel('Save folder name').inputValue(), 'game');
+    assert.equal(await history.getByLabel('Game save directory', { exact: true }).inputValue(), 'game');
+    assert.equal(await history.getByLabel('Game save directory', { exact: true }).isDisabled(), true);
     assert.equal(state.revision, 5, 'Selecting files must not change server saves before confirmation');
     if (process.env.SCREENSHOT_PATH) await page.screenshot({ path: process.env.SCREENSHOT_PATH });
     await history.getByRole('button', { name: 'Import and use saves', exact: true }).click();
@@ -246,7 +260,23 @@ const server = createServer(async (request, response) => {
     await history.getByRole('button', { name: 'Download', exact: true }).first().click();
     const importedZip = zipFiles(readFileSync(await (await importDownload).path()));
     assert.equal(importedZip.get('game/1.save').toString(), 'imported desktop save');
+    directoryKnown = false;
+    await history.getByRole('button', { name: 'Refresh', exact: true }).click();
+    await page.waitForFunction(() => [...document.querySelectorAll('[data-save-history-dialog] button')]
+      .some(button => button.textContent === 'Import save folder' && !button.disabled));
+    await history.getByLabel('Save files', { exact: true }).setInputFiles([
+      { name: 'renamed.save', mimeType: 'application/octet-stream', buffer: Buffer.from('another save') },
+    ]);
+    const unknown = history.getByLabel('Advanced: enter a verified runtime save directory', { exact: true });
+    await unknown.waitFor();
+    assert.equal(await unknown.inputValue(), '');
+    assert.equal(await history.getByRole('button', { name: 'Import and use saves', exact: true }).isDisabled(), true);
+    await history.getByText(/The game’s save directory is not known yet/).waitFor();
+    await unknown.fill('VerifiedGame');
+    assert.equal(await history.getByRole('button', { name: 'Import and use saves', exact: true }).isEnabled(), true);
+    await history.getByRole('button', { name: 'Cancel import', exact: true }).click();
+    assert.equal(state.revision, 6, 'An unknown destination never silently imports to a guessed folder');
     assert.deepEqual(errors, []);
-    console.log('PASS: both launchers export ZIP files, restore personal history, fit mobile, and confirm imports before replacing saves');
+    console.log('PASS: both launchers export/restore saves, fit mobile, protect known destinations, and require a verified unknown destination');
   } finally { if (browser) await browser.close(); server.close(); }
 })().catch(error => { console.error(error); process.exitCode = 1; });
