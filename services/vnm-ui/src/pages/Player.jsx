@@ -410,6 +410,7 @@ export default function Player() {
           </div>
         ) : (
           <BuildProgress
+            gameId={gameId}
             buildState={buildState}
             gameTitle={title}
             jobId={jobId}

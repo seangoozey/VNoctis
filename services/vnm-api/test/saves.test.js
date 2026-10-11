@@ -122,7 +122,8 @@ test('SQLite migration and authenticated per-user/game revision API', async t =>
           payload: { directory, buildVersion: game.builtAt?.toISOString() || null } });
       };
       const job = await prisma.buildJob.create({ data: { gameId: 'Y' } });
-      const callback = body => app.inject({ method: 'POST', url: `/api/v1/internal/build/${job.id}/status`, headers: { authorization: 'A' }, payload: body });
+      await prisma.game.update({ where: { id: 'Y' }, data: { buildJobId: job.id }, select: { id: true } });
+      const callback = (body, id = job.id) => app.inject({ method: 'POST', url: `/api/v1/internal/build/${id}/status`, headers: { authorization: 'A' }, payload: body });
       await runtime('OldBuild');
       assert.equal((await callback({ status: 'done', saveDirectory: '../bad' })).statusCode, 400);
       assert.equal((await history()).json().saveDirectory, 'OldBuild');
@@ -151,7 +152,9 @@ test('SQLite migration and authenticated per-user/game revision API', async t =>
       assert.equal((await get('B', 'Y')).json().saveDirectory, 'BuiltGame');
       await callback({ status: 'failed' });
       assert.equal((await history()).json().saveDirectory, 'RuntimeOverride');
-      await callback({ status: 'done', saveDirectory: null });
+      const rebuilt = await prisma.buildJob.create({ data: { gameId: 'Y' } });
+      await prisma.game.update({ where: { id: 'Y' }, data: { buildJobId: rebuilt.id }, select: { id: true } });
+      await callback({ status: 'done', saveDirectory: null }, rebuilt.id);
       assert.equal((await history()).json().saveDirectorySource, null);
       assert.equal((await history()).json().saveDirectory, null, 'Old snapshots cannot establish a rebuilt game’s new destination');
       assert.deepEqual((await get('A', 'Y')).json().snapshot, copy);

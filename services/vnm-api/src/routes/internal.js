@@ -63,7 +63,7 @@ export default async function internalRoutes(fastify) {
    */
   fastify.post('/internal/build/:jobId/status', async (request, reply) => {
     const { jobId } = request.params;
-    const { status, error, webBuildPath, saveDirectory = null } = request.body || {};
+    const { status, error, webBuildPath, stage, saveDirectory = null } = request.body || {};
 
     if (saveDirectory !== null && (typeof saveDirectory !== 'string' || !saveDirectory || saveDirectory.length > 400 ||
         /[\\:\x00-\x1f]/.test(saveDirectory) || saveDirectory.split('/').some(p => !p || p === '.' || p === '..') ||
@@ -90,13 +90,15 @@ export default async function internalRoutes(fastify) {
       });
     }
 
+    if (['done', 'failed', 'cancelled'].includes(job.status)) return { ok: true, ignored: true };
+
     const now = new Date();
 
     // ── Update BuildJob ───────────────────────────────────
     const jobUpdate = { status };
 
     if (status === 'building') {
-      jobUpdate.startedAt = now;
+      if (!job.startedAt) jobUpdate.startedAt = now;
     }
 
     if (status === 'done' || status === 'failed') {
@@ -128,19 +130,28 @@ export default async function internalRoutes(fastify) {
     }
 
     if (status === 'failed') {
-      gameUpdate.buildStatus = 'failed';
+      gameUpdate.buildStatus = await buildFailureStatus(await fastify.prisma.game.findUnique({ where: { id: job.gameId } }));
     }
 
     // Publish completion and its destination together, using the save writer's
     // queue so imports cannot observe half of a completed build callback.
-    await writeTransaction(fastify.prisma, async tx => {
-      await tx.buildJob.update({ where: { id: jobId }, data: jobUpdate });
-      if (Object.keys(gameUpdate).length > 0) {
-        await tx.game.update({ where: { id: job.gameId }, data: gameUpdate, select: { id: true } });
-        // Runtime metadata belongs to the previous build until the new one runs.
-        if (status === 'done') await tx.saveRuntimeDirectory.deleteMany({ where: { gameId: job.gameId } });
-      }
+    const accepted = await writeTransaction(fastify.prisma, async tx => {
+      const changed = await tx.buildJob.updateMany({ where: { id: jobId, status: { in: ['queued', 'building'] } }, data: jobUpdate });
+      if (!changed.count) return false;
+    await tx.workJob.updateMany({ where: { id: jobId, status: { in: ['queued', 'running'] } }, data: {
+      status: status === 'building' ? 'running' : status,
+      stage: status === 'building' ? (['unpacking-rpa', 'optimizing', 'packaging', 'publishing', 'building'].includes(stage) ? stage : 'building') : status,
+      ...(status !== 'building' ? { completedAt: now } : {}),
+      ...(error ? { error: String(error).slice(0, 4000) } : {}),
+    } });
+
+
+      const gameChanged = await tx.game.updateMany({ where: { id: job.gameId, buildJobId: jobId }, data: gameUpdate });
+      // Do not invalidate a newer build's runtime destination on a stale callback.
+      if (status === 'done' && gameChanged.count) await tx.saveRuntimeDirectory.deleteMany({ where: { gameId: job.gameId } });
+      return true;
     });
+    if (!accepted) return { ok: true, ignored: true };
 
     request.log.info(
       { jobId, gameId: job.gameId, status },
@@ -181,6 +192,7 @@ export default async function internalRoutes(fastify) {
     }
 
     fastify.buildLogBuffers[jobId].push(line);
+    if (fastify.buildLogBuffers[jobId].length > 2000) fastify.buildLogBuffers[jobId].shift();
 
     // Broadcast to SSE subscribers
     if (fastify.buildLogSubscribers && fastify.buildLogSubscribers[jobId]) {
@@ -196,3 +208,4 @@ export default async function internalRoutes(fastify) {
     return { ok: true };
   });
 }
+import { buildFailureStatus } from '../services/buildJobs.js';
