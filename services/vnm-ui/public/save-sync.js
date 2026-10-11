@@ -18,10 +18,68 @@
   try { meta = JSON.parse(localStorage.getItem(metaKey)) || { revision: 0, dirty: false }; }
   catch { meta = { revision: 0, dirty: true }; }
   let initialized = false, blocked = false, busy = false, timer;
+  let mutationVersion = 0;
+  const snapshotVersions = new WeakMap();
   let lastUploadedContents = null, lastStatus;
   let lastUploadedSlots = new Map();
   let lastUploadedFiles = null, deltaUploads = false;
-  const encodedFiles = new Map();
+  // IDBFS belongs to the engine thread; only copy bytes there. Comparisons,
+  // base64 encoding and large request serialization belong to this worker.
+  function saveProcessor() {
+    const encoded = new Map();
+    return ({ operation, value }) => {
+      if (operation === 'json') return JSON.stringify(value);
+      const present = new Set(value.map(file => file.path));
+      for (const path of encoded.keys()) if (!present.has(path)) encoded.delete(path);
+      return { version: 1, files: value.map(({ path, mtime, bytes }) => {
+        const cached = encoded.get(path);
+        let same = cached?.bytes.length === bytes.length;
+        if (same) for (let i = 0; i < bytes.length; i++) {
+          if (bytes[i] !== cached.bytes[i]) { same = false; break; }
+        }
+        let data = cached?.data;
+        if (!same) {
+          let binary = '';
+          for (let i = 0; i < bytes.length; i += 8192) binary += String.fromCharCode(...bytes.subarray(i, i + 8192));
+          data = btoa(binary); encoded.set(path, { bytes, data });
+        }
+        return { path, mtime, data };
+      }) };
+    };
+  }
+  const processLocally = saveProcessor();
+  let saveWorker, taskId = 0;
+  const workerTasks = new Map();
+  try {
+    if (typeof Worker === 'function') {
+      const script = `const process = (${saveProcessor.toString()})();
+        onmessage = ({data: {id, operation, value}}) => {
+          try { postMessage({id, result: process({operation, value})}); }
+          catch (error) { postMessage({id, error: error.message}); }
+        };`;
+      const url = URL.createObjectURL(new Blob([script], { type: 'text/javascript' }));
+      try { saveWorker = new Worker(url); } finally { URL.revokeObjectURL(url); }
+      saveWorker.onmessage = ({ data }) => {
+        const task = workerTasks.get(data.id); if (!task) return;
+        workerTasks.delete(data.id);
+        if (data.error) task.reject(new Error(data.error)); else task.resolve(data.result);
+      };
+      saveWorker.onerror = event => {
+        event.preventDefault?.(); saveWorker.terminate(); saveWorker = null;
+        for (const task of workerTasks.values()) task.reject(new Error('Save processing interrupted — browser saves retained'));
+        workerTasks.clear();
+      };
+    }
+  } catch { saveWorker = null; }
+  async function processSave(operation, value) {
+    if (!saveWorker) return processLocally({ operation, value });
+    return new Promise((resolve, reject) => {
+      const id = ++taskId; workerTasks.set(id, { resolve, reject });
+      try {
+        saveWorker.postMessage({ id, operation, value }, operation === 'snapshot' ? value.map(file => file.bytes.buffer) : []);
+      } catch (error) { workerTasks.delete(id); reject(error); }
+    });
+  }
   let slotWritePending = false, urgentUploadPending = false;
   let pendingUpload = null;
   let acknowledgedSlots = null;
@@ -33,9 +91,9 @@
   };
   const slots = copy => new Map(copy.files.filter(file => file.path.endsWith('.save'))
     .map(file => [file.path, file.data]));
-  const slotContents = copy => JSON.stringify([...slots(copy)].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0));
+  const slotContents = copy => processSave('json', [...slots(copy)].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0));
   async function checkpoint(copy, revision, saveChecksum = null) {
-    const next = { revision, contents: slotContents(copy), saveChecksum };
+    const next = { revision, contents: await slotContents(copy), saveChecksum };
     await outbox('put', next, 'baselines'); acknowledgedSlots = next;
   }
   // Ren'Py may flush repeatedly or touch mtimes without changing save bytes.
@@ -57,7 +115,7 @@
     const response = await fetch(`/api/v1/games/${encodeURIComponent(gameId)}/saves${query}`, {
       method, cache: 'no-store', signal: AbortSignal.timeout(8000),
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-      ...(body ? { body: JSON.stringify(body) } : {}),
+      ...(body ? { body: await processSave('json', body) } : {}),
     });
     if (response.status === 409 && query === '/directory') {
       throw Object.assign(new Error('Save directory belongs to a different build'), { code: 'SAVE_BUILD_CHANGED' });
@@ -113,7 +171,8 @@
     }
     return api('PUT', { ...metadata, snapshot: full });
   }
-  function snapshot() {
+  async function snapshot() {
+    const capturedVersion = mutationVersion;
     const files = [];
     function walk(directory) {
       for (const name of fs.readdir(directory).filter(n => n !== '.' && n !== '..').sort()) {
@@ -122,25 +181,24 @@
         if (fs.isDir(stat.mode)) walk(path);
         else if (fs.isFile(stat.mode)) {
           const bytes = fs.readFile(path);
-          const cached = encodedFiles.get(path);
-          let same = cached?.bytes.length === bytes.length;
-          if (same) for (let i = 0; i < bytes.length; i++) {
-            if (bytes[i] !== cached.bytes[i]) { same = false; break; }
-          }
-          let data = cached?.data;
-          if (!same) {
-            let binary = '';
-            for (let i = 0; i < bytes.length; i += 8192) binary += String.fromCharCode(...bytes.subarray(i, i + 8192));
-            data = btoa(binary); encodedFiles.set(path, { bytes: new Uint8Array(bytes), data });
-          }
-          files.push({ path: path.slice(root.length + 1), mtime: stat.mtime.getTime(), data });
+          // Own the transferred buffer even if a filesystem implementation
+          // returns a view into the engine's memory rather than a fresh copy.
+          files.push({ path: path.slice(root.length + 1), mtime: stat.mtime.getTime(), bytes: new Uint8Array(bytes) });
         }
       }
     }
     walk(root);
-    const present = new Set(files.map(file => `${root}/${file.path}`));
-    for (const path of encodedFiles.keys()) if (!present.has(path)) encodedFiles.delete(path);
-    return { version: 1, files };
+    try {
+      const copy = await processSave('snapshot', files);
+      snapshotVersions.set(copy, capturedVersion);
+      return copy;
+    }
+    catch (error) {
+      // A blocked/crashed worker has transferred its buffers. Recapture from
+      // the untouched filesystem for the compatibility fallback.
+      if (!saveWorker) return snapshot();
+      throw error;
+    }
   }
   function restore(copy) {
     // Validate completely before touching the filesystem, even for server data.
@@ -244,7 +302,9 @@
       }) };
   }
   async function start() {
-    let local = snapshot();
+    let local;
+    try { local = await snapshot(); }
+    catch (error) { blocked = true; status('Save sync paused — unable to prepare browser saves. Browser saves retained.'); return; }
     if (!meta.dirty) {
       lastUploadedContents = contents(local);
       lastUploadedSlots = slots(local);
@@ -272,15 +332,17 @@
         if (legacy) { local = legacy; restore(local); await flush(); meta.dirty = true; remember(); }
       }
       const knownBaseline = acknowledgedSlots?.revision === meta.revision;
-      const slotChanges = knownBaseline ? meta.dirty && acknowledgedSlots.contents !== slotContents(local)
+      const localSlots = await slotContents(local);
+      const remoteSlots = remote.snapshot ? await slotContents(remote.snapshot) : null;
+      const slotChanges = knownBaseline ? meta.dirty && acknowledgedSlots.contents !== localSlots
         : (meta.dirty || meta.revision === 0) && local.files.length > 0;
-      const slotsAgree = remote.snapshot && slotContents(local) === slotContents(remote.snapshot);
+      const slotsAgree = remote.snapshot && localSlots === remoteSlots;
       const needsUpload = !remote.snapshot ? local.files.length > 0 : !slotsAgree &&
         (slotChanges || (meta.alternate && meta.dirty));
       if (needsUpload) {
         // Publish one-sided offline progress, or preserve it as an alternate if
         // another device also advanced. Neither case needs a blocking choice.
-        if (knownBaseline && acknowledgedSlots.contents === slotContents(remote.snapshot || { files: [] })) {
+        if (knownBaseline && acknowledgedSlots.contents === (remoteSlots ?? await slotContents({ files: [] }))) {
           meta.baseSaveChecksum = remote.saveChecksum;
         }
         const next = requestFor(local);
@@ -321,16 +383,18 @@
     await outbox('delete'); pendingUpload = null;
     meta.revision = result.revision; meta.baseSaveChecksum = base; meta.alternate = alternate;
     meta.branchId = alternate ? result.branchId : null;
-    meta.dirty = !sameContents(contents(snapshot()), contents(copy)); remember();
+    const current = await snapshot();
+    meta.dirty = mutationVersion !== snapshotVersions.get(current) || !sameContents(contents(current), contents(copy)); remember();
     lastUploadedContents = contents(copy); lastUploadedSlots = slots(copy);
     lastUploadedFiles = alternate ? null : new Map(copy.files.map(file => [file.path, file.data]));
+    return current;
   }
   async function upload() {
     if (!initialized || blocked || busy || !meta.dirty) return;
     busy = true;
     let syncingNotice;
     try {
-      const copy = pendingUpload?.snapshot || snapshot(); const copyContents = contents(copy);
+      const copy = pendingUpload?.snapshot || await snapshot(); const copyContents = contents(copy);
       if (!pendingUpload && sameContents(copyContents, lastUploadedContents)) {
         meta.dirty = false; remember();
         return;
@@ -342,7 +406,7 @@
       if (!pendingUpload) {
         // Alternate continuations retain real save changes, without archiving
         // every seen-text/preference flush as another unresolved alternative.
-        if (meta.alternate && slotContents(copy) === acknowledgedSlots?.contents) {
+        if (meta.alternate && await slotContents(copy) === acknowledgedSlots?.contents) {
           meta.dirty = false; remember(); return;
         }
         const next = requestFor(copy);
@@ -352,9 +416,8 @@
       syncingNotice = setTimeout(() => status('Syncing…'), 500);
       const result = await sendUpload(pendingUpload);
       clearTimeout(syncingNotice);
-      await acknowledge(copy, result);
-      const current = snapshot();
-      meta.dirty = !sameContents(contents(current), copyContents);
+      const current = await acknowledge(copy, result);
+      meta.dirty = mutationVersion !== snapshotVersions.get(current) || !sameContents(contents(current), copyContents);
       if (current.files.some(file => file.path.endsWith('.save') && lastUploadedSlots.get(file.path) !== file.data)) {
         urgentUploadPending = true;
       }
@@ -392,17 +455,18 @@
     fs.close = stream => {
       const wroteSlot = initialized && (stream.flags & 3) !== 0 && isSaveSlot(stream.path);
       const result = nativeClose(stream);
-      if (wroteSlot) scheduleSlotFlush();
+      if (wroteSlot) { mutationVersion++; scheduleSlotFlush(); }
       return result;
     };
     const nativeRename = fs.rename.bind(fs);
     fs.rename = (from, to) => {
       const result = nativeRename(from, to);
-      if (initialized && isSaveSlot(to)) scheduleSlotFlush();
+      if (initialized && isSaveSlot(to)) { mutationVersion++; scheduleSlotFlush(); }
       return result;
     };
     fs.syncfs = (populate, callback = () => {}) => {
       if (!populate && initialized) {
+        mutationVersion++;
         meta.dirty = true;
         try { remember(); } catch { blocked = true; status('Browser storage full — sync paused'); }
       }

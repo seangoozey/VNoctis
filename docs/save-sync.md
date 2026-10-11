@@ -341,6 +341,24 @@ ZIP. Repeat the handoff between physical devices, including mobile Safari.
 These full gameplay/device checks require game fixtures and are not covered by
 the filesystem integration test.
 
+## Browser processing and autosave performance
+
+Routine snapshot byte comparisons, base64 encoding, and large JSON serialization
+run in a dedicated Web Worker. The bridge copies filesystem bytes on the game
+thread and transfers owned buffers, leaving engine memory intact. Writes made
+during worker processing remain dirty and follow the acknowledged upload;
+acknowledgement reuses its validation scan instead of scanning a third time.
+
+Browsers that block workers use the original synchronous processing fallback.
+A crashed worker falls back without discarding local saves or the pending outbox.
+This moves VNoctis save preparation, not Ren'Py's own autosave serialization,
+filesystem access, or IndexedDB persistence. Those can still cause pauses.
+
+Run `npm run test:save-worker` in `services/vnm-ui` for native-browser checks of
+worker processing, writes during preparation/acknowledgement, retained engine
+buffers, and blocked/crashed worker fallback. Set `PLAYWRIGHT_CHANNEL=chrome`
+to use an installed Chrome instead of Playwright's bundled Chromium.
+
 ## Separate upstream issue
 
 The existing migration history lacks the Game `publishStatus`, `publishedAt`, and
