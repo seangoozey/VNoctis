@@ -169,6 +169,30 @@ function browser(server, databases, { user = 'A', game = 'X', metadata = new Map
   };
 }
 
+test('startup restores a server snapshot larger than 32 MiB', async () => {
+  const data = Buffer.alloc(3 * 1024 * 1024, 7).toString('base64');
+  const copy = { version: 1, files: Array.from({ length: 11 }, (_, i) => ({
+    path: `game/${i}.save`, mtime: 1234, data,
+  })) };
+  const server = new Map([['A:X', { revision: 1, snapshot: copy }]]);
+  const page = browser(server, new Map()); await page.start();
+  assert.equal(page.fs.readFile(`${root}/game/10.save`).length, 3 * 1024 * 1024);
+  assert.ok(page.statuses.includes('Saves synced'));
+  assert.equal(server.uploads.length, 0);
+});
+
+test('startup recovery validation failure retains local files and pauses without rejecting initialization', async () => {
+  const databases = new Map([['vnm-saves:A:X', { files: new Map([
+    [`${root}/game/bad\\name.save`, { bytes: Buffer.from('retained'), mtime: 1234 }],
+  ]) }]]);
+  const server = new Map(); const page = browser(server, databases);
+  page.offline(true); await page.start();
+  assert.equal(Buffer.from(page.fs.readFile(`${root}/game/bad\\name.save`)).toString(), 'retained');
+  assert.ok(page.statuses.some(message => message.startsWith('Save sync paused')));
+  page.offline(false); await page.retry();
+  assert.equal(server.uploads.length, 0);
+});
+
 test('permanent upload rejection pauses all triggers and retains latest local saves and outbox across reload', async () => {
   const server = new Map(), databases = new Map();
   server.uploadRejection = { status: 400, message: 'Invalid resulting save snapshot.' };
