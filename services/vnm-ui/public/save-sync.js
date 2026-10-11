@@ -11,6 +11,7 @@
     if (claim.userId !== userId) return;
   } catch { return; }
   const root = '/home/web_user/.renpy';
+  const maxSnapshotBytes = 128 * 1024 * 1024;
   const namespace = `vnm-saves:${encodeURIComponent(userId)}:${encodeURIComponent(gameId)}`;
   const metaKey = `${namespace}:meta`;
   let meta;
@@ -153,7 +154,7 @@
       seen.add(file.path);
       const bytes = Uint8Array.from(atob(file.data), c => c.charCodeAt(0));
       total += bytes.length;
-      if (total > 32 * 1024 * 1024) throw new Error('Snapshot too large');
+      if (total > maxSnapshotBytes) throw new Error('Snapshot exceeds the 128 MiB limit');
       return { ...file, bytes };
     });
     for (const path of seen) {
@@ -304,7 +305,12 @@
     } catch (error) {
       // Unknown server revision must never become permission to overwrite it later.
       // Restore failures also leave the previously loaded local files available.
-      restore(local);
+      try { restore(local); }
+      catch (restoreError) {
+        blocked = true;
+        status(`Save sync paused — ${restoreError.message}. Browser saves retained.`);
+        return;
+      }
       status(blocked ? error.message : 'Offline — browser saves only');
     }
   }
