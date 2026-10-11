@@ -1,4 +1,4 @@
-const MAX_BYTES = 32 * 1024 * 1024;
+const MAX_BYTES = 128 * 1024 * 1024;
 export const validPath = path => typeof path === 'string' && path.length > 0 && path.length <= 512 &&
   !/[\\:\x00-\x1f]/.test(path) && !path.split('/').some(part => !part || part === '.' || part === '..');
 const table = Uint32Array.from({ length: 256 }, (_, value) => {
@@ -22,7 +22,7 @@ export function snapshotZip(snapshot) {
     seen.add(file.path);
     const bytes = Uint8Array.from(atob(file.data), character => character.charCodeAt(0));
     total += bytes.length;
-    if (total > MAX_BYTES) throw new Error('Save snapshot exceeds 32 MB');
+    if (total > MAX_BYTES) throw new Error('Save snapshot exceeds 128 MiB');
     const name = new TextEncoder().encode(file.path), crc = crc32(bytes);
     const date = new Date(file.mtime), year = Math.max(1980, Math.min(2107, date.getFullYear() || 1980));
     const time = (date.getHours() << 11) | (date.getMinutes() << 5) | (date.getSeconds() >> 1);
@@ -64,7 +64,7 @@ export async function readSaveFolder(selected, suggestedFolder = '') {
   const parent = [...parents][0];
   const included = entries.filter(entry => saves.includes(entry) || entry.path === (parent ? `${parent}/persistent` : 'persistent') ||
     /(^|\/)tokens\/security_keys\.txt$/.test(entry.path) || entry.path === 'security_keys.txt');
-  if (included.length > 4096 || included.reduce((size, entry) => size + entry.file.size, 0) > MAX_BYTES) throw new Error('Save imports are limited to 4096 files and 32 MB.');
+  if (included.length > 4096 || included.reduce((size, entry) => size + entry.file.size, 0) > MAX_BYTES) throw new Error('Save imports are limited to 4096 files and 128 MiB.');
   // A PC save folder may be renamed or simply called "saves". Its name tells
   // us nothing about the web runtime's configured destination.
   const folder = suggestedFolder;

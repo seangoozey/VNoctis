@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import Fastify from 'fastify';
 import { PrismaClient } from '@prisma/client';
-import savesRoutes, { validateDelta, validateSnapshot } from '../src/routes/saves.js';
+import savesRoutes, { validateDelta, validateSnapshot, snapshotValidationError } from '../src/routes/saves.js';
 import { readCurrent } from '../src/services/saveHistory.js';
 import internalRoutes from '../src/routes/internal.js';
 
@@ -29,6 +29,15 @@ test('snapshot rejects traversal, ambiguous trees, malformed bytes and invalid t
   assert.equal(validateSnapshot(bad), false);
   bad.files[0] = { path: 'test/save', data: '', mtime: -1 };
   assert.equal(validateSnapshot(bad), false);
+});
+
+test('save limit accepts folders over 32 MiB and still bounds aggregate decoded bytes', () => {
+  const data = 'A'.repeat(4 * 1024 * 1024); // 3 MiB decoded per entry.
+  const copy = { version: 1, files: Array.from({ length: 12 }, (_, i) => ({ path: `game/${i}.save`, mtime: 1, data })) };
+  assert.equal(validateSnapshot(copy), true, '36 MiB is a legitimate bounded snapshot');
+  copy.files = Array.from({ length: 43 }, (_, i) => ({ path: `game/${i}.save`, mtime: 1, data }));
+  assert.equal(validateSnapshot(copy), false, '129 MiB remains rejected');
+  assert.equal(snapshotValidationError(copy).code, 'SAVE_SNAPSHOT_TOO_LARGE');
 });
 
 test('delta validation rejects unsafe, duplicate, overlapping, and malformed paths', () => {
@@ -185,8 +194,9 @@ test('SQLite migration and authenticated per-user/game revision API', async t =>
     await t.test('invalid snapshot and oversized body leave server state intact', async () => {
       const copy = snapshot(); copy.files[0].path = '../attack';
       assert.equal((await put('A', 2, copy)).statusCode, 400);
-      const huge = snapshot(); huge.files[0].data = 'A'.repeat(46 * 1024 * 1024);
-      assert.equal((await put('A', 2, huge)).statusCode, 413);
+      const huge = await app.inject({ method: 'PUT', url: '/api/v1/games/X/saves',
+        headers: { authorization: 'A', 'content-length': String(180 * 1024 * 1024) }, payload: { revision: 2, snapshot: snapshot() } });
+      assert.equal(huge.statusCode, 413);
       assert.equal((await get('A')).json().revision, 2);
     });
     await t.test('upload IDs acknowledge retries and reject reused IDs or competing progress', async () => {

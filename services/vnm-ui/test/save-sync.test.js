@@ -115,6 +115,10 @@ function browser(server, databases, { user = 'A', game = 'X', metadata = new Map
         return { ok: true, status: 200, json: async () => body };
       }
       server.uploads.push(structuredClone(body));
+      if (server.uploadRejection && (!server.uploadRejection.deltaOnly || body.delta)) {
+        const { status: code, ...details } = server.uploadRejection;
+        return { ok: false, status: code, json: async () => details };
+      }
       const identity = JSON.stringify(body.delta || body.snapshot);
       const receiptKey = `${key}:${body.uploadId}`, receipt = server.receipts.get(receiptKey);
       if (receipt) {
@@ -164,6 +168,46 @@ function browser(server, databases, { user = 'A', game = 'X', metadata = new Map
     async retry() { await interval(); await settle(); },
   };
 }
+
+test('permanent upload rejection pauses all triggers and retains latest local saves and outbox across reload', async () => {
+  const server = new Map(), databases = new Map();
+  server.uploadRejection = { status: 400, message: 'Invalid resulting save snapshot.' };
+  const first = browser(server, databases); await first.start(); await first.save('first');
+  assert.equal(server.uploads.length, 1);
+  assert.match(first.statuses.at(-1), /Save sync paused/);
+  await first.save('latest'); await first.retry(); await first.event('online'); await first.visibility('visible');
+  assert.equal(server.uploads.length, 1, 'Permanent rejection must not repeatedly upload');
+  const restarted = browser(server, databases); await restarted.start(); await restarted.retry();
+  assert.equal(server.uploads.length, 2, 'Reload attempts once and pauses again');
+  assert.match(restarted.statuses.at(-1), /Save sync paused/);
+  assert.equal(Buffer.from(restarted.fs.readFile(`${root}/game/1.save`)).toString(), 'latest');
+  delete server.uploadRejection;
+  const recovered = browser(server, databases); await recovered.start(); await recovered.retry();
+  assert.equal(Buffer.from(server.get('A:X').snapshot.files.find(file => file.path.endsWith('1.save')).data, 'base64').toString(), 'latest');
+});
+
+test('temporary server errors retry the same pending upload and recover', async () => {
+  const server = new Map(), databases = new Map();
+  const page = browser(server, databases); await page.start();
+  server.uploadRejection = { status: 503, message: 'Temporary failure' };
+  await page.save('offline progress'); await page.retry();
+  assert.ok(server.uploads.length >= 2);
+  assert.equal(new Set(server.uploads.map(upload => upload.uploadId)).size, 1);
+  delete server.uploadRejection; await page.retry();
+  assert.equal(server.get('A:X').revision, 1);
+});
+
+test('invalid expanded delta retries once as its preserved full snapshot', async () => {
+  const server = new Map(), databases = new Map();
+  const page = browser(server, databases); await page.start(); await page.save('baseline');
+  server.uploadRejection = { status: 400, code: 'SAVE_INVALID_RESULT', message: 'File overlaps folder', deltaOnly: true };
+  const prior = server.uploads.length; await page.save('new progress');
+  const attempts = server.uploads.slice(prior);
+  assert.equal(attempts.length, 2);
+  assert.ok(attempts[0].delta); assert.ok(attempts[1].snapshot);
+  assert.equal(attempts[0].uploadId, attempts[1].uploadId);
+  assert.equal(server.get('A:X').revision, 2);
+});
 
 test('runtime directory reporting is independent of saves and retries after offline startup', async () => {
   const server = new Map();
