@@ -208,6 +208,7 @@ test('deduplicated server history restores rotating RenPy slots without adding f
       const invalid = await ownCall('PUT', '', { revision: 3, uploadId: 'delta-invalid',
         delta: { version: 1, files: [{ path: 'game', mtime: 1, data: encoded('file replacing a directory') }], deleted: [] } });
       assert.equal(invalid.statusCode, 400);
+      assert.equal(invalid.json().code, 'SAVE_INVALID_RESULT');
       assert.equal((await ownCall('GET', '')).json().revision, 3);
       assert.equal((await ownCall('PUT', '', { ...patch, delta: { ...patch.delta, files: [{ ...changed, data: encoded('reused ID') }] } })).statusCode, 409);
     });
@@ -244,6 +245,20 @@ test('deduplicated server history restores rotating RenPy slots without adding f
       const restore = await ownCall('POST', `/history/${before.currentVersionId}/restore`, { revision: after.revision, uploadId: 'restore-before-import' });
       assert.equal(restore.statusCode, 200);
       assert.deepEqual((await ownCall('GET', '')).json().snapshot, before.snapshot);
+    });
+    await t.test('a valid incremental update can grow the complete snapshot beyond 32 MiB', async () => {
+      const ownCall = (method, body) => call(method, '', body, 'B', 'Y');
+      const before = (await ownCall('GET')).json();
+      const data = Buffer.alloc(17 * 1024 * 1024).toString('base64');
+      const first = { path: 'game/1.save', mtime: 1, data };
+      const full = await ownCall('PUT', { revision: before.revision, uploadId: 'large-baseline', snapshot: { version: 1, files: [first] } });
+      assert.equal(full.statusCode, 200, full.body);
+      const updated = await ownCall('PUT', { revision: full.json().revision, uploadId: 'large-delta',
+        delta: { version: 1, files: [{ ...first, path: 'game/2.save' }], deleted: [] } });
+      assert.equal(updated.statusCode, 200, updated.body);
+      const complete = (await ownCall('GET')).json();
+      assert.equal(complete.snapshot.files.length, 2);
+      assert.equal(complete.snapshot.files.reduce((bytes, file) => bytes + Buffer.byteLength(file.data, 'base64'), 0), 34 * 1024 * 1024);
     });
   } finally {
     await app.close(); await prisma.$disconnect(); rmSync(directory, { recursive: true, force: true });

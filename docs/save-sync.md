@@ -81,9 +81,16 @@ upload or restore. Cleanup protects blobs referenced by either history or live
 state. This uses the existing SQLite backup/migration path. Initial imports,
 unknown baselines, alternate continuations, and stale-delta fallbacks send the
 full save tree. Ordinary acknowledged updates send only changed files/deletions.
-Limits on the complete resulting tree are 32 MiB decoded bytes, 4096 files,
-512-character relative paths, and a 46 MiB HTTP body. Files are never unpickled,
+Limits on the complete resulting tree are 128 MiB decoded bytes, 4096 files,
+512-character relative paths, and an approximately 179 MiB HTTP body allowance
+for base64 encoding and metadata. Files are never unpickled,
 unzipped, or written to server filesystem paths.
+
+Permanent upload rejections pause automatic retries while retaining the pending
+upload and latest browser saves. Temporary outages still retry. Invalid expanded
+deltas retry once using their preserved full snapshot; validation errors identify
+oversize data or malformed file trees instead of reporting an offline connection.
+Reopening the game retries retained progress after the server problem is fixed.
 
 Creation uses a unique `(userId, gameId)` key. Save transactions are serialized
 for SQLite and store live state, immutable history, and receipts together. A stale

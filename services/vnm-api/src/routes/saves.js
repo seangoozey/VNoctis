@@ -1,11 +1,14 @@
 import { createHash } from 'node:crypto';
 import { archive, canonical, collectBlobs, digest, ensureCurrentVersion, prepareFiles, prune, pruneAll, readCurrent, readVersion, saveChecksum, saveKind, writeCurrent, writeTransaction } from '../services/saveHistory.js';
 
-export const MAX_SNAPSHOT_BYTES = 32 * 1024 * 1024;
+export const MAX_SNAPSHOT_BYTES = 128 * 1024 * 1024;
 
 // Never deserialize Ren'Py saves or write client-supplied paths on the server.
-export function validateSnapshot(snapshot) {
-  if (!snapshot || snapshot.version !== 1 || !Array.isArray(snapshot.files) || snapshot.files.length > 4096) return false;
+export function snapshotValidationError(snapshot) {
+  const invalid = message => ({ code: 'SAVE_INVALID_SNAPSHOT', message });
+  const tooLarge = () => ({ code: 'SAVE_SNAPSHOT_TOO_LARGE', message: 'Save data exceeds the 128 MiB limit.' });
+  if (!snapshot || snapshot.version !== 1 || !Array.isArray(snapshot.files)) return invalid('Invalid save snapshot format.');
+  if (snapshot.files.length > 4096) return invalid('Save data exceeds the 4096-file limit.');
   const paths = new Set();
   let bytes = 0;
   for (const file of snapshot.files) {
@@ -13,24 +16,27 @@ export function validateSnapshot(snapshot) {
         !file.path || file.path.split('/').some(p => !p || p === '.' || p === '..') ||
         /[\\\x00-\x1f]/.test(file.path) || paths.has(file.path) ||
         !Number.isSafeInteger(file.mtime) || file.mtime < 0 || file.mtime > 8640000000000000 ||
-        typeof file.data !== 'string' || file.data.length > MAX_SNAPSHOT_BYTES * 4 / 3 ||
+        typeof file.data !== 'string' ||
         file.data.length % 4 !== 0 || /[^A-Za-z0-9+/=]/.test(file.data) ||
         file.data.slice(0, -2).includes('=') ||
-        (file.data.at(-2) === '=' && file.data.at(-1) !== '=')) return false;
+        (file.data.at(-2) === '=' && file.data.at(-1) !== '=')) return invalid('Save data contains an invalid path, timestamp, duplicate file, or encoding.');
+    if (file.data.length > Math.ceil(MAX_SNAPSHOT_BYTES / 3) * 4) return tooLarge();
     paths.add(file.path);
     bytes += Buffer.byteLength(file.data, 'base64');
-    if (bytes > MAX_SNAPSHOT_BYTES) return false;
+    if (bytes > MAX_SNAPSHOT_BYTES) return tooLarge();
   }
   // A file cannot also be an ancestor directory.
   for (const path of paths) {
     const parts = path.split('/');
     while (parts.length > 1) {
       parts.pop();
-      if (paths.has(parts.join('/'))) return false;
+      if (paths.has(parts.join('/'))) return invalid('Save data contains a file that overlaps a folder.');
     }
   }
-  return true;
+  return null;
 }
+
+export const validateSnapshot = snapshot => snapshotValidationError(snapshot) === null;
 
 export function validateDelta(delta) {
   if (!delta || !validateSnapshot({ version: delta.version, files: delta.files }) ||
@@ -54,7 +60,7 @@ export default async function savesRoutes(fastify) {
   });
   fastify.addHook('onClose', async () => { clearInterval(retentionTimer); await retentionTask; });
   const options = {
-    bodyLimit: 46 * 1024 * 1024,
+    bodyLimit: Math.ceil(MAX_SNAPSHOT_BYTES * 4 / 3) + 8 * 1024 * 1024,
     onRequest: async request => { request.saveStartedAt = performance.now(); },
     schema: { params: { type: 'object', required: ['gameId'], properties: {
       gameId: { type: 'string', minLength: 1, maxLength: 128, pattern: '^[A-Za-z0-9_-]+$' },
@@ -124,7 +130,8 @@ export default async function savesRoutes(fastify) {
         (baseSaveChecksum !== null && (typeof baseSaveChecksum !== 'string' || !/^[a-f0-9]{64}$/.test(baseSaveChecksum))) ||
         (branchId !== null && (typeof branchId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(branchId))) ||
         typeof alternate !== 'boolean' || typeof deviceLabel !== 'string' || !deviceLabel || deviceLabel.length > 80 || /[\x00-\x1f]/.test(deviceLabel)) {
-      return reply.code(400).send({ message: 'Invalid save snapshot' });
+      return reply.code(400).send((incremental ? snapshotValidationError({ version: delta?.version, files: delta?.files }) : snapshotValidationError(snapshot)) ||
+        { code: 'SAVE_INVALID_SNAPSHOT', message: 'Invalid save upload metadata or deleted file paths.' });
     }
     let copy = incremental ? null : canonical(snapshot);
     let payload = incremental ? null : JSON.stringify(copy);
@@ -156,7 +163,13 @@ export default async function savesRoutes(fastify) {
         for (const path of delta.deleted) files.delete(path);
         for (const file of delta.files) files.set(file.path, file);
         copy = canonical({ version: 1, files: [...files.values()] });
-        if (!validateSnapshot(copy)) return { error: 'Invalid resulting save snapshot.', status: 400 };
+        const validationError = snapshotValidationError(copy);
+        if (validationError) {
+          request.log.warn({ saveValidation: { ...validationError, files: copy.files.length,
+            decodedBytes: copy.files.reduce((sum, file) => sum + Buffer.byteLength(file.data, 'base64'), 0),
+            maxBytes: MAX_SNAPSHOT_BYTES } }, 'Save upload rejected after delta expansion');
+          return { error: validationError.message, code: validationError.code === 'SAVE_SNAPSHOT_TOO_LARGE' ? validationError.code : 'SAVE_INVALID_RESULT', status: 400 };
+        }
         payload = JSON.stringify(copy); checksum = digest(payload);
         prepared = prepareFiles(copy); incomingSlots = saveChecksum(copy);
         mark('expandDeltaMs');
@@ -248,7 +261,7 @@ export default async function savesRoutes(fastify) {
         typeof uploadId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(uploadId) || !validateSnapshot(snapshot) ||
         !snapshot.files.some(file => file.path.endsWith('.save')) || snapshot.files.some(file => file.path.includes(':') ||
           (!file.path.endsWith('.save') && file.path.split('/').at(-1) !== 'persistent' && file.path !== 'tokens/security_keys.txt'))) {
-      return reply.code(400).send({ message: 'Select valid Ren’Py save files, persistent data, and optional signing keys (up to 32 MB).' });
+      return reply.code(400).send({ message: 'Select valid Ren’Py save files, persistent data, and optional signing keys (up to 128 MiB).' });
     }
     const key = { userId: request.user.userId, gameId: request.params.gameId };
     const marker = digest(`import:${JSON.stringify(canonical(snapshot))}`);

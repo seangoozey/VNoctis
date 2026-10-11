@@ -51,7 +51,7 @@ test('folder import rejects unrelated, multi-game, oversize, duplicate, and unsa
   await assert.rejects(readSaveFolder([file('Folder/log.txt', [1])]), /\.save/);
   await assert.rejects(readSaveFolder([file('Root/A/1.save', [1]), file('Root/B/1.save', [1])]), /one game/);
   await assert.rejects(readSaveFolder([file('../1.save', [1])]), /unsafe/);
-  await assert.rejects(readSaveFolder([{ ...file('Folder/1.save', [1]), size: 33 * 1024 * 1024 }]), /32 MB/);
+  await assert.rejects(readSaveFolder([{ ...file('Folder/1.save', [1]), size: 129 * 1024 * 1024 }]), /128 MiB/);
   const duplicate = await readSaveFolder([file('Folder/1.save', [1]), file('Folder/1.save', [2])]);
   assert.throws(() => importSnapshot(duplicate, 'Game'), /duplicate/);
   assert.throws(() => importSnapshot(duplicate, '../Game'), /valid/);

@@ -66,7 +66,16 @@
       if (details.code === 'SAVE_BASE_CHANGED') throw Object.assign(new Error(details.message), { code: details.code });
       blocked = true; throw new Error('Save upload could not be verified — device saves retained');
     }
-    if (!response.ok) throw new Error(`Save service unavailable (${response.status})`);
+    if (!response.ok) {
+      if (method === 'PUT' && response.status >= 400 && response.status < 500 && ![408, 429].includes(response.status)) {
+        const details = await response.json().catch(() => ({}));
+        // A rejected delta can retry once as its preserved full snapshot.
+        if (details.code === 'SAVE_INVALID_RESULT') throw Object.assign(new Error(details.message), { code: details.code });
+        blocked = true;
+        throw new Error(`Save sync paused — ${typeof details.message === 'string' ? details.message.slice(0, 200) : `upload rejected (${response.status})`}. Browser saves retained.`);
+      }
+      throw new Error(`Save service unavailable (${response.status})`);
+    }
     return response.json();
   };
   let directoryPending = false, directoryRecorded = false;
@@ -95,7 +104,7 @@
     if (delta) {
       try { return await api('PUT', { ...metadata, delta }); }
       catch (error) {
-        if (error.code !== 'SAVE_BASE_CHANGED') throw error;
+        if (!['SAVE_BASE_CHANGED', 'SAVE_INVALID_RESULT'].includes(error.code)) throw error;
         // Persist the fallback before sending it, so a lost full-upload response
         // or reload retries exactly the same request and upload ID.
         delete request.delta; await outbox('put', request);
@@ -296,7 +305,7 @@
       // Unknown server revision must never become permission to overwrite it later.
       // Restore failures also leave the previously loaded local files available.
       restore(local);
-      status('Offline — browser saves only');
+      status(blocked ? error.message : 'Offline — browser saves only');
     }
   }
   async function acknowledge(copy, result) {
