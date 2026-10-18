@@ -55,10 +55,10 @@ const server = createServer(async (req, res) => {
   let browser;
   try {
     browser = await chromium.launch({ headless: true, ...(process.env.PLAYWRIGHT_CHANNEL ? { channel: process.env.PLAYWRIGHT_CHANNEL } : {}) });
-    for (const mode of ['worker', 'blocked', 'crash', 'slow-download', 'manifest', 'reference']) {
+    for (const mode of ['worker', 'blocked', 'crash', 'slow-download', 'manifest', 'reference', 'reference-race']) {
       state = { revision: 0, snapshot: null }; uploads = [];
-      manifestMode = ['manifest', 'reference'].includes(mode); binaryRequests = 0;
-      referenceMode = mode === 'reference'; versions = new Map();
+      manifestMode = ['manifest', 'reference', 'reference-race'].includes(mode); binaryRequests = 0;
+      referenceMode = mode.startsWith('reference'); versions = new Map();
       slowDownload = mode === 'slow-download';
       if (slowDownload) state = { revision: 1, snapshot: { version: 1, files: [
         { path: 'game/1.save', mtime: 1234, data: Buffer.from([13]).toString('base64') },
@@ -71,6 +71,18 @@ const server = createServer(async (req, res) => {
       const context = await browser.newContext();
       await context.addInitScript(({ token, mode }) => {
         localStorage.setItem('vnm-token', token);
+        window.raceWarnings = [];
+        const warn = console.warn; console.warn = (...args) => { raceWarnings.push(args[1]); warn(...args); };
+        if (mode === 'reference-race') {
+          const nativeFetch = fetch;
+          window.fetch = async (...args) => {
+            const response = await nativeFetch(...args);
+            if (args[1]?.method === 'PUT' && window.raceAfterUpload) {
+              window.raceAfterUpload = false; window.raceNextHash = true;
+            }
+            return response;
+          };
+        }
         window.workerOperations = []; window.mainEncodings = 0; window.mainLargeJson = 0;
         const jsonTasks = new Set(); window.timeoutDuringJson = false;
         const timeout = AbortSignal.timeout.bind(AbortSignal);
@@ -92,6 +104,16 @@ const server = createServer(async (req, res) => {
           postMessage(message, transfers) {
             workerOperations.push(message.operation);
             if (message.operation === 'json') jsonTasks.add(message.id);
+            if (mode === 'reference-race' && message.operation === 'hashes' && window.raceNextHash) {
+              window.raceNextHash = false; window.delaySaveWorker = 150;
+              setTimeout(() => {
+                window.races = (window.races || 0) + 1;
+                FS.rename('/home/web_user/.renpy/game/1.save', '/home/web_user/.renpy/game/auto-race.save');
+                savedBytes[0] = window.races === 1 ? 9 : 11;
+                FS.writeFile('/home/web_user/.renpy/game/1.save', savedBytes);
+                FS.syncfs(false, () => {});
+              }, 10);
+            }
             if (mode === 'worker' && message.operation === 'snapshot' && workerOperations.filter(operation => operation === 'snapshot').length === 3) {
               // A later write after the acknowledgement scan has captured its
               // bytes must not be cleared by that scan's asynchronous result.
@@ -144,6 +166,7 @@ const server = createServer(async (req, res) => {
         window.animationTicks = 0;
         const animate = () => { animationTicks++; requestAnimationFrame(animate); }; requestAnimationFrame(animate);
         window.delaySaveWorker = mode === 'worker' ? 150 : 0;
+        if (mode === 'reference-race') { window.raceNextHash = true; window.raceAfterUpload = true; }
         FS.writeFile('/home/web_user/.renpy/game/1.save', savedBytes);
         FS.syncfs(false, () => {});
       }, mode);
@@ -157,11 +180,11 @@ const server = createServer(async (req, res) => {
         });
       }
       const deadline = Date.now() + 15000;
-      const expected = mode === 'worker' ? 11 : 7;
-      while ((!state.snapshot || Buffer.from(state.snapshot.files[0].data, 'base64')[0] !== expected) && Date.now() < deadline) {
+      const expected = ['worker', 'reference-race'].includes(mode) ? 11 : 7;
+      while ((!state.snapshot || Buffer.from(state.snapshot.files.find(file => file.path === 'game/1.save')?.data || '', 'base64')[0] !== expected) && Date.now() < deadline) {
         await new Promise(resolve => setTimeout(resolve, 30));
       }
-      assert.equal(Buffer.from(state.snapshot?.files[0]?.data || '', 'base64')[0], expected);
+      assert.equal(Buffer.from(state.snapshot?.files.find(file => file.path === 'game/1.save')?.data || '', 'base64')[0], expected);
       const metrics = await frame.evaluate(() => ({ operations: workerOperations, mainEncodings, mainLargeJson, animationTicks,
         firstByte: FS.readFile('/home/web_user/.renpy/game/1.save')[0], bytes: FS.readFile('/home/web_user/.renpy/game/1.save').length }));
       assert.equal(metrics.firstByte, expected, 'worker transfer must not detach or mutate engine memory');
@@ -181,11 +204,17 @@ const server = createServer(async (req, res) => {
         }));
         assert.equal(catalog.baseVersionId, state.currentVersionId);
         assert.equal(metrics.mainEncodings, 0); assert.equal(metrics.mainLargeJson, 0);
+        if (mode === 'reference-race') {
+          assert.equal(await frame.evaluate(() => races), 2, 'exercise preparation and acknowledgement races');
+          assert.deepEqual(await frame.evaluate(() => raceWarnings), [], 'ordinary autosave races are not storage failures');
+          assert.equal(uploads.length, 2, 'acknowledgement retries must not resend an accepted request');
+          assert.ok(state.snapshot.files.some(file => file.path === 'game/auto-race.save'));
+        }
         const before = uploads.length;
         await page.reload();
         const reopened = page.frames().find(frame => frame.url().includes('/game?'));
         await reopened.waitForFunction(() => document.body.dataset.ready === 'true');
-        assert.equal(await reopened.evaluate(() => FS.readFile('/home/web_user/.renpy/game/1.save')[0]), 7);
+        assert.equal(await reopened.evaluate(() => FS.readFile('/home/web_user/.renpy/game/1.save')[0]), expected);
         assert.equal(uploads.length, before, 'reload restores the catalog without publishing an empty filesystem');
       }
       if (mode === 'worker') {
