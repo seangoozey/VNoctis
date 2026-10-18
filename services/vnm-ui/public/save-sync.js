@@ -103,7 +103,7 @@
     });
   }
   let slotWritePending = false, urgentUploadPending = false;
-  let pendingUpload = null;
+  let pendingUpload = null, acceptedUpload = null, preparationRetry = null;
   let acknowledgedSlots = null;
   let fs, nativeSync, originalGetDB;
   const status = (message, saveUploaded = false, notice = false) => {
@@ -157,7 +157,7 @@
       const prepared = createSaveCatalog(captured);
       const hashed = await processSave('hashes', copy);
       if (mutationVersion !== snapshotVersions.get(copy) || logicalCatalog.export().generation !== captured.generation) {
-        throw new Error('Save catalog changed during preparation');
+        throw Object.assign(new Error('Save catalog changed during preparation'), { code: 'SAVE_CATALOG_CHANGED' });
       }
       prepared.mergeResident(hashed);
       logicalCatalog = prepared;
@@ -234,7 +234,7 @@
     }
     return {
       mergeResident(files, expectedGeneration = generation) {
-        if (generation !== expectedGeneration) throw new Error('Save catalog changed during preparation');
+        if (generation !== expectedGeneration) throw Object.assign(new Error('Save catalog changed during preparation'), { code: 'SAVE_CATALOG_CHANGED' });
         // Absence is a cache miss. Only explicit remove/rename operations can
         // delete logical paths. Hydration with identical bytes is not a save.
         for (const file of files) {
@@ -922,7 +922,7 @@
     if (logicalCatalog && pendingUpload?.catalog) {
       const captured = snapshotCatalogs.get(current);
       const hashed = await processSave('hashes', current);
-      if (mutationVersion !== snapshotVersions.get(current)) throw new Error('Save catalog changed during preparation');
+      if (mutationVersion !== snapshotVersions.get(current)) throw Object.assign(new Error('Save catalog changed during preparation'), { code: 'SAVE_CATALOG_CHANGED' });
       logicalCatalog.mergeResident(hashed, captured.generation);
       const previous = logicalCatalog.export();
       logicalCatalog.acknowledge(result.versionId ? pendingUpload.catalog : { files: previous.baseHashes.map(hash => ({ hash })) },
@@ -942,6 +942,8 @@
   async function upload() {
     if (!initialized || blocked || busy || !meta.dirty) return;
     busy = true;
+    clearTimeout(preparationRetry);
+    let retryPreparation = false;
     let syncingNotice;
     let stage = 'prepare';
     try {
@@ -969,11 +971,13 @@
       // Fast background uploads should not flash the status on each interaction.
       syncingNotice = setTimeout(() => status('Syncing…'), 500);
       stage = 'upload';
-      const result = await sendUpload(pendingUpload);
+      const result = acceptedUpload?.request === pendingUpload ? acceptedUpload.result : await sendUpload(pendingUpload);
+      acceptedUpload = { request: pendingUpload, result };
       const acceptedCopy = pendingUpload.snapshot;
       clearTimeout(syncingNotice);
       stage = 'storage';
       const current = await acknowledge(acceptedCopy, result);
+      acceptedUpload = null;
       meta.dirty = mutationVersion !== snapshotVersions.get(current) || !sameContents(contents(current), contents(acceptedCopy));
       if (current.files.some(file => file.path.endsWith('.save') && lastUploadedSlots.get(file.path) !== file.data)) {
         urgentUploadPending = true;
@@ -981,10 +985,21 @@
       remember(); status(!startupLoaded ? 'Browser save uploaded — server saves were not loaded. Reopen the game.'
         : result.disposition === 'alternate' ? 'Save backed up as alternate version'
         : meta.dirty ? 'Syncing…' : 'Saves synced', saveUploaded);
-    } catch (error) { reportFailure(stage, error); status(failureStatus(stage, error)); }
+    } catch (error) {
+      if (error.code === 'SAVE_CATALOG_CHANGED') {
+        // Ren'Py can rotate autosave aliases or finish another flush while the
+        // worker hashes an earlier copy. Discard that stale preparation, keep
+        // local progress/outbox intact, and retry after the write burst settles.
+        // If the server already accepted it, reuse the acknowledgement locally.
+        retryPreparation = true;
+      } else { reportFailure(stage, error); status(failureStatus(stage, error)); }
+    }
     finally {
       clearTimeout(syncingNotice); busy = false;
-      if (urgentUploadPending) { urgentUploadPending = false; upload(); }
+      if (retryPreparation) {
+        urgentUploadPending = false;
+        preparationRetry = setTimeout(() => { preparationRetry = null; upload(); }, 250);
+      } else if (urgentUploadPending) { urgentUploadPending = false; upload(); }
     }
   }
   window.Module = window.Module || {};
