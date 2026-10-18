@@ -292,7 +292,7 @@ by CSP, or cross-origin game hosting displays the player fallback status. Such
 builds keep their original browser-local storage behavior and do not synchronize.
 R2 public galleries are cross-origin and unauthenticated; they are outside this
 feature. Direct game URLs without the player parameters also remain local-only.
-The feature does not make the manager or game assets offline-installable.
+Full offline preparation is explicit in the per-user dashboard; ordinary on-demand caching alone does not make a game ready offline.
 If a game update changes its own `config.save_directory` or save compatibility,
 the old snapshot remains stored, but VNoctis cannot make the new game interpret it.
 
@@ -342,6 +342,286 @@ These full gameplay/device checks require game fixtures and are not covered by
 the filesystem integration test.
 
 ## Browser processing and autosave performance
+
+### Incremental startup downloads
+
+On HTTPS and localhost, the bridge requests `GET /games/:gameId/saves?manifest=1`
+instead of the full base64 snapshot. The response includes `fileDownloads: true`
+and a version-1 manifest of `{path, mtime, hash, size}` records, together with the
+existing revision, directory, checksum and upload-receipt information. A null
+manifest means there is no server state; an empty manifest is an existing empty
+state. Older clients can continue using the original snapshot endpoint.
+
+The bridge hashes the populated user/game browser filesystem in its save worker.
+Matching bytes are reused even when autosave rotation moved them to another
+filename. Missing content is requested as binary data from
+`GET /games/:gameId/saves/files/:hash?revision=N`, verified against SHA-256 and
+size, and assembled before changing the engine filesystem. Unchanged resident
+files are not rewritten. Deletions follow the complete manifest.
+
+Both endpoints require the authenticated account and an existing game. Binary
+access requires a current-file association for that account/game and the exact
+revision; a globally known hash or another user's history grants no access.
+Responses use `Cache-Control: no-store`. A changed revision returns 409 with
+`SAVE_MANIFEST_CHANGED`; startup retries the manifest once. Inline legacy states
+remain readable without a schema migration. Receipts, offline alternatives and
+pending-upload recovery retain the existing protocol.
+
+Incremental transfers underpin guarded latest-slot-first startup, described
+below. Existing browser files and a bounded verified memory cache provide reuse;
+a separate persistent immutable cache/readiness dashboard remains future work.
+Without Web Crypto (for example, an insecure HTTP LAN origin), or with an older
+API, the bridge retains the complete-snapshot download fallback. Download failures
+use the existing `vnm-save-status` messages and `SaveSyncToast`, not a second toast
+implementation. Existing builds retain complete hydration; rebuilding with the
+updated builder enables the version-gated engine adapter where supported.
+
+### Explicit server-save preparation
+
+`public/save-offline.js` exports `createSavePreparation` for the per-user
+dashboard. It can prepare saves without starting Ren'Py: fetch the manifest,
+download individual immutable files with two concurrent transfers, verify their
+sizes/SHA-256 hashes, then recheck the server revision and build. Unchanged
+verified files are reused. Cancellation, quota errors, changed server state,
+dirty local progress or pending uploads prevent successful preparation.
+
+Prepared bytes live in the separate `vnm-prepared-saves` IndexedDB database,
+scoped to the authenticated user/game. Save readiness rehashes the actual files,
+rather than trusting a stored completion flag. New browser progress does not
+discard an otherwise complete checkpoint: the dashboard reports "Available
+offline · sync pending" while the bridge retains engine/outbox progress. A
+checkpoint older than a known acknowledged revision cannot establish readiness. It identifies the captured
+server revision/build and preparation time, not ongoing server freshness or
+complete game/app availability. Cleanup also removes interrupted transfers for
+that scope; it never deletes engine saves or pending uploads. Retained immutable
+copies may use additional disk space until that scope is cleared.
+
+The bridge uses verified prepared files for matching server-manifest hashes.
+After transient startup failures, a clean session may restore the explicit
+prepared checkpoint locally. It refuses older revisions or a different known
+same-revision baseline, never replacing newer acknowledged browser progress.
+Dirty/pending sessions retain the existing filesystem/outbox recovery path.
+The status is `Offline — using prepared saves`, not a successful server sync.
+
+### Preparing and managing offline games
+
+Open **Dashboard → Prepare a game**, choose a completed local build and select
+**Prepare offline**. The estimate covers game bytes, with saves added separately.
+Preparation downloads the public app shell, all listed game assets and the current
+account's complete save checkpoint. Two concurrent transfers stream game assets
+to Cache Storage with incremental SHA-256 verification; a large archive does not
+need one equally large ArrayBuffer. Previously verified files are reused. The
+HTML bridge reference is refreshed when the app changes, even if the game has
+not been rebuilt. Cancellation retains completed files for the next attempt.
+Quota failures and interrupted downloads cannot publish a completeness marker.
+
+The builder writes `.vnm-offline-manifest.json` after the SDK finishes. Existing
+games need one rebuild with this builder before full offline preparation is
+available. The authenticated `offline-manifest` and `offline-file` routes bind
+original bytes to a completed build; Nginx denies direct access to private
+`.vnm-*` files. The public `cache-build` route exposes only build identity and
+status for the on-demand asset worker. R2/cross-origin builds are excluded.
+
+The dashboard tracks games per authenticated account. Public game assets are
+physically shared on this origin, while save checkpoints, runtime saves and
+pending uploads are scoped to the account and game. Removing downloads removes
+that account's library entry; physical assets remain if another account still
+uses them. It keeps engine saves, prepared save checkpoints and pending uploads.
+Updating a game retains the previous complete entry until the replacement
+finishes, then unpins obsolete builds so unused copies can be removed. A running
+old-build tab remains protected by the worker's client check.
+
+A normal dashboard check verifies the app shell and prepared save bytes, checks
+the game completion receipt, and confirms every listed game asset still exists.
+**Verify** additionally streams and rehashes all game bytes. Corruption or
+missing files removes readiness; **Update offline files** repairs them. Readiness
+refers to a captured build/save checkpoint, not perpetual server freshness. After
+new online saves advance the acknowledged revision, update preparation again.
+Unsynced browser progress is preserved and remains playable offline; preparation
+will not replace it. Open the game online to let it sync before refreshing the
+server checkpoint.
+
+The root app worker caches public app files only, never API/auth responses. A
+closed tab can reopen `/dashboard` or a retained player route offline using the
+last server-verified account profile and its unexpired token. Logout, an account
+change or a real 401/403 denial invalidates that fallback. Offline profiles have
+no administrative privileges. Reconnect to renew an expired session. This is
+normal shared-browser account isolation, not protection against malicious
+same-origin scripts or someone with browser developer access.
+
+**Protect downloaded files** requests persistent browser storage and explicitly
+reports a refusal; browsers may still remove ordinary storage or users can clear
+it manually. Physical mobile/Safari eviction and persistence policies still need
+device validation. Desktop Chrome tests cover a fully disabled network, closed-tab
+app/game reopening, native Continue, pending progress, separate accounts,
+corruption/eviction repair, shared cleanup, cancellation/resume and denial of an
+invalid session. Existing browsers without preparation continue through the
+ordinary bridge without downloading the optional preparation module.
+
+### Preview catalogs and coordinated transfers
+
+The API also advertises `previewDownloads: true` and serves
+`GET /games/:gameId/saves/files/:hash/preview?revision=N`. It uses the same
+account/game ownership and revision checks as binary downloads and requires a
+current `.save` association. The result is `{version: 2, supported, metadata,
+screenshot}`, with an optional PNG thumbnail encoded as base64. Unsupported or
+invalid formats return `supported: false` so the lazy-slot adapter can
+fall back to the original complete save instead of inventing an empty slot.
+
+Extraction reads only ZIP directory entries, bounded JSON (64 KiB) and a bounded
+PNG (4 MiB, at most four million pixels). Large thumbnails are normalized with
+Sharp to fit 384×216, with a 256 KiB output limit, without changing the original
+save bytes. This accommodates native web saves whose PNG is stored uncompressed
+inside the deflated ZIP. It verifies lengths and ZIP CRCs;
+deflate runs asynchronously with a bounded output length. It never reads or
+deserializes the pickled game-state log. Encryption, ZIP64, legacy TGA-only
+previews and unsupported archive layouts fall back. Results, including unsupported
+markers, persist in `SaveFileBlob.preview` and disappear when the blob is pruned.
+Older preview cache versions are regenerated on the next authorized request.
+The `20261016000000_save_previews` migration adds this nullable cache column.
+Cache hits recheck authorization and do not read the full blob contents.
+
+The bridge now coordinates two concurrent content transfers, joins requests for
+the same revision/hash, supports queued foreground priority and independent
+consumer cancellation, and retains a bounded 16 MiB memory cache of verified
+content. Cancelling all consumers aborts their transfer. A failed verification
+or changed account never populates the cache. Retries can reuse already verified
+content. This cache contains downloaded copies only, not pending upload data;
+evicting it cannot discard local progress. Installation still belongs to the
+engine thread, separately from content fetching.
+
+Preview queries use bounded concurrency and deduplicate identical hashes.
+Unsupported previews hydrate their complete slot before startup. Excessive
+preview catalogs fall back to complete hydration rather than allocating an
+unbounded collection of thumbnails.
+
+### Logical snapshots for partially cached folders
+
+The API advertises `referenceUploads: true`. A PUT can contain `fileSnapshot`
+instead of `snapshot` or `delta`, with an upload ID and the usual revision,
+checksum and branch metadata:
+
+```json
+{
+  "version": 1,
+  "baseVersionId": "an-authenticated-history-version",
+  "files": [
+    { "path": "Game/1-1.save", "mtime": 1000, "data": "bmV3IHNhdmU=" },
+    { "path": "Game/auto-2.save", "mtime": 900, "hash": "<64 lowercase hex characters>", "size": 800000 }
+  ]
+}
+```
+
+This describes the complete **logical** folder, not the browser's resident subset.
+Each entry contains either new base64 bytes or a hash/size reference authorized
+by `baseVersionId` for this account and game. References can move between paths,
+so autosave rotation/copying needs no download. Knowing a blob hash, another
+account's baseline, or another game's baseline grants no access. The server
+expands and validates the complete folder before using the existing history,
+revision and receipt transaction. Stale offline progress is archived against its
+own baseline, never assembled from the current device's different progress.
+Receipt identity is independent of file ordering.
+
+Manifest requests ensure a readable baseline version exists. History retention
+still applies: a pruned/missing baseline returns `SAVE_REFERENCE_BASE_MISSING`.
+Receipts are checked first, so a committed retry remains acknowledged even after
+that baseline is gone. The sender can retry as a complete snapshot using verified
+local bytes for **every** logical reference, preserving its upload ID. If any
+referenced bytes are unavailable, syncing pauses and retains the pending request
+and browser progress. It does not drop uncached slots or repeatedly send failures.
+This explicit retention limit must remain visible when lazy/offline mode ships.
+
+The bridge persists its logical catalog in the per-user/game `catalogs` store
+in outbox database version 3. When the server advertises reference uploads and
+Web Crypto is available, it generates logical snapshots from hash-verified
+resident files and the captured catalog. Other servers/origins retain the
+previous full/delta protocol. Signing/persistent files retain their bytes rather
+than depending on an older slot baseline. Local catalog recovery data never
+travels in the API request.
+
+If the account/game's engine filesystem is empty but its pending-upload backup
+survives, startup restores those backed-up resident files before contacting the
+server. Cached progress therefore remains loadable during a save-service outage.
+A populated engine filesystem is retained because it may contain newer writes.
+This cannot recover data if browser storage eviction also removes the outbox.
+
+Filesystem rename/unlink hooks maintain explicit aliases/deletions. Native
+filesystem flushes capture catalog state and persist it only after their storage
+operation succeeds. Monotonic ordering prevents an older callback from replacing
+a newer catalog. Unchanged catalog generations do not cause repeated database
+writes on routine engine flushes. Hashes are cached with unchanged worker bytes.
+
+Request preparation checks both filesystem mutation and catalog generation.
+Acknowledgements merge current resident writes before advancing the baseline,
+persist the updated catalog/checkpoint, and then clear the acknowledged outbox
+entry. A write during an upload remains dirty and follows it; lost responses
+reuse the exact persisted logical request and receipt on reload. These are
+ordered recovery writes across the existing databases, not a single transaction
+shared with the engine's IDBFS store.
+
+### Version-gated latest-slot startup
+
+The builder checks normalized source fingerprints for the researched Ren'Py
+8.5.2.26010301 `loadsave.py` and `savelocation.py`. It generates an early private
+module in the temporary build overlay and advertises capability only after
+confirming that the compiled adapter exists in the published `game.zip`.
+Unrecognized SDK sources retain complete hydration. The runtime also checks its
+version; direct game URLs without an authenticated bridge keep native behavior.
+Imported prebuilt games and existing builds without the marker use the fallback.
+
+On a clean launch with matching build/directory metadata and capable endpoints,
+the bridge retrieves the manifest, previews, required support/signing data and
+the newest loadable canonical slot. Verified resident files are reused. Metadata
+and thumbnails expose other slots immediately. It does not automatically load
+the newest slot or bypass the menu. Dirty/pending-upload recovery deliberately
+uses the complete hydration path before replaying the existing preservation
+protocol. Transfers remain individual binary requests.
+
+The native location adapter supplies catalog-only slot listing, timestamps, JSON
+and screenshots. Missing selected slots wait cooperatively for a verified exact
+file through the coordinator. A cancellable HTML loading overlay covers this
+wait; failures return through a narrow, trusted SDK-generated abort boundary in
+load/get_save_data, preserving current progress and posting the existing player
+toast. Repeated identical failures restart the same toast's visibility timer.
+The version-sensitive abort boundary preserves original function objects/aliases;
+it is intentionally limited to the pinned SDK rather than a generic Ren'Py API.
+
+After startup, two bounded prefetch workers fill missing files individually.
+Hydration installs only when the alias still has the expected hash and no newer
+local file replaced it. Installation does not trigger a save upload. Binary
+`GET /games/:gameId/saves/versions/:versionId/files/:hash` checks history ownership
+by account/game and pins the requested immutable version across later autosaves;
+history retention still applies. Local pending bytes remain separate from cache.
+
+Canonical copy/rename/delete operations update remote aliases even without local
+bytes. Matching `sync/` mirrors do not force eager downloads or rotate twice.
+When a remote-only source replaces a resident destination, the stale destination
+is invalidated so the native scanner cannot revive old bytes. Logical hash-based
+checkpoints distinguish cache growth from new progress during offline recovery.
+
+Validation includes a synthetic native game built with the production adapter,
+the real bridge/worker, authenticated fixture transport and migrated SQLite API:
+latest-only startup, metadata for seven slots, delayed native FileLoad, saving
+while five old slots are uncached, failed-load preservation/toast/retry, remote-only
+autosave rotation, and native QuickLoad after background prefetch. Isolated
+Abnormal/LTA web builds also passed latest-only startup, native load and save
+checks. Native recovery checks cover warm partial-cache restarts, save-service
+outages, cached/uncached loads, pending progress across tab closure and engine
+database loss, reconnection, lost acknowledgements and competing device progress.
+Those recovery tests keep runtime/game assets available. Separate full-app
+Chrome tests disable all HTTP and verify closed-tab native offline launches.
+Physical mobile/Safari, custom save backends and other SDK versions remain
+release-validation gates.
+
+Save requests allow 60 seconds for the network operation, including reading the
+response body. Upload preparation completes before that timer starts. Startup
+downloads retry a transient network, timeout, or server failure once before
+allowing the game to continue using its browser copy. Later uploads never imply
+that the server snapshot loaded successfully, and do not replace a running
+game's files with server progress. Reopen the game to retry a failed startup.
+Console warnings identify download, upload, preparation, restore, or storage
+failures without including credentials or save data. Authentication failures
+pause syncing and ask the player to sign in again.
 
 Routine snapshot byte comparisons, base64 encoding, and large JSON serialization
 run in a dedicated Web Worker. The bridge copies filesystem bytes on the game

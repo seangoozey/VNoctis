@@ -19,6 +19,7 @@ import importRoutes from './routes/import.js';
 import internalRoutes from './routes/internal.js';
 import favoritesRoutes from './routes/favorites.js';
 import savesRoutes from './routes/saves.js';
+import offlineRoutes from './routes/offline.js';
 import usersRoutes from './routes/users.js';
 import settingsRoutes from './routes/settings.js';
 import publishRoutes from './routes/publish.js';
@@ -201,6 +202,7 @@ await fastify.register(authRoutes, { prefix: '/api/v1' });
 // ── Favorites routes (per-user) ───────────────────────────
 await fastify.register(favoritesRoutes, { prefix: '/api/v1' });
 await fastify.register(savesRoutes, { prefix: '/api/v1' });
+await fastify.register(offlineRoutes, { prefix: '/api/v1' });
 
 // ── User management routes (admin-only) ───────────────────
 await fastify.register(usersRoutes, { prefix: '/api/v1' });
@@ -226,6 +228,7 @@ fastify.addHook('onRequest', async (request, reply) => {
     url.startsWith('/api/v1/auth/') ||
     url.startsWith('/api/v1/internal/') ||
     url.startsWith('/api/v1/covers/') ||
+    (request.method === 'GET' && /^\/api\/v1\/games\/[a-f0-9]{32}\/cache-build(?:\?|$)/.test(url)) ||
     /^\/api\/v1\/build\/[^/]+\/log/.test(url) ||
     /^\/api\/v1\/publish\/[^/]+\/progress/.test(url)
   ) {

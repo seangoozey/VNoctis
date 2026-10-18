@@ -4,20 +4,47 @@ const { createServer } = require('node:http');
 const { readFileSync } = require('node:fs');
 const assert = require('node:assert/strict');
 const vm = require('node:vm');
+const { createHash } = require('node:crypto');
 const bridge = readFileSync(require('node:path').resolve(__dirname, '../public/save-sync.js'));
 const playerTest = readFileSync(require('node:path').resolve(__dirname, 'player-integration.cjs'), 'utf8');
 const fixture = vm.runInNewContext(playerTest.match(/const fixture = (`[\s\S]*?`);/)[1]);
 const token = `header.${Buffer.from(JSON.stringify({ userId: 'A' })).toString('base64url')}.signature`;
-let state, uploads;
+let state, uploads, slowDownload, manifestMode, binaryRequests, referenceMode, versions;
 const server = createServer(async (req, res) => {
   const json = value => { res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify(value)); };
   if (req.url === '/save-sync.js') { res.setHeader('Content-Type', 'application/javascript'); return res.end(bridge); }
   if (req.url.startsWith('/api/')) {
-    if (req.method === 'GET') return json({ ...state, deltaUploads: false });
+    if (req.method === 'GET') {
+      if (slowDownload) { slowDownload = false; await new Promise(resolve => setTimeout(resolve, 9000)); }
+      if (manifestMode && req.url.includes('/files/')) {
+        binaryRequests++;
+        const hash = req.url.split('/files/')[1].split('?')[0];
+        const file = state.snapshot.files.find(file => createHash('sha256').update(Buffer.from(file.data, 'base64')).digest('hex') === hash);
+        res.setHeader('Content-Type', 'application/octet-stream');
+        return res.end(Buffer.from(file.data, 'base64'));
+      }
+      if (manifestMode && req.url.includes('manifest=1')) {
+        const currentVersionId = state.currentVersionId || 'initial';
+        if (!versions.has(currentVersionId)) versions.set(currentVersionId, structuredClone(state.snapshot));
+        return json({
+        revision: state.revision, fileDownloads: true, deltaUploads: false,
+        referenceUploads: referenceMode, currentVersionId,
+        manifest: { version: 1, files: state.snapshot.files.map(file => ({ path: file.path, mtime: file.mtime,
+          size: Buffer.byteLength(file.data, 'base64'), hash: createHash('sha256').update(Buffer.from(file.data, 'base64')).digest('hex') })) },
+      }); }
+      return json({ ...state, deltaUploads: false });
+    }
     let text = ''; for await (const chunk of req) text += chunk;
-    const body = JSON.parse(text); uploads.push(body);
-    state = { revision: state.revision + 1, snapshot: body.snapshot };
-    return json({ revision: state.revision, disposition: 'current' });
+    const body = JSON.parse(text); uploads.push(structuredClone(body));
+    if (body.fileSnapshot) {
+      const baseline = versions.get(body.fileSnapshot.baseVersionId);
+      const available = new Map(baseline.files.map(file => [createHash('sha256').update(Buffer.from(file.data, 'base64')).digest('hex'), file.data]));
+      body.snapshot = { version: 1, files: body.fileSnapshot.files.map(file => ({ path: file.path, mtime: file.mtime,
+        data: file.data ?? available.get(file.hash) })) };
+    }
+    state = { revision: state.revision + 1, snapshot: body.snapshot, currentVersionId: `version-${state.revision + 1}` };
+    versions.set(state.currentVersionId, structuredClone(state.snapshot));
+    return json({ revision: state.revision, disposition: 'current', ...(referenceMode ? { versionId: state.currentVersionId } : {}) });
   }
   res.setHeader('Content-Type', 'text/html');
   res.end(req.url.startsWith('/game') ? fixture : '<iframe src="/game?vnmGame=X&vnmUser=A"></iframe>');
@@ -28,12 +55,26 @@ const server = createServer(async (req, res) => {
   let browser;
   try {
     browser = await chromium.launch({ headless: true, ...(process.env.PLAYWRIGHT_CHANNEL ? { channel: process.env.PLAYWRIGHT_CHANNEL } : {}) });
-    for (const mode of ['worker', 'blocked', 'crash']) {
+    for (const mode of ['worker', 'blocked', 'crash', 'slow-download', 'manifest', 'reference']) {
       state = { revision: 0, snapshot: null }; uploads = [];
+      manifestMode = ['manifest', 'reference'].includes(mode); binaryRequests = 0;
+      referenceMode = mode === 'reference'; versions = new Map();
+      slowDownload = mode === 'slow-download';
+      if (slowDownload) state = { revision: 1, snapshot: { version: 1, files: [
+        { path: 'game/1.save', mtime: 1234, data: Buffer.from([13]).toString('base64') },
+      ] } };
+      if (manifestMode) state = { revision: 1, snapshot: { version: 1, files: [
+        { path: 'game/1.save', mtime: 1000, data: Buffer.alloc(800 * 1024, 17).toString('base64') },
+        { path: 'game/auto-2.save', mtime: 1000, data: Buffer.alloc(800 * 1024, 17).toString('base64') },
+        { path: 'game/persistent', mtime: 1000, data: Buffer.from('preferences').toString('base64') },
+      ] } };
       const context = await browser.newContext();
       await context.addInitScript(({ token, mode }) => {
         localStorage.setItem('vnm-token', token);
         window.workerOperations = []; window.mainEncodings = 0; window.mainLargeJson = 0;
+        const jsonTasks = new Set(); window.timeoutDuringJson = false;
+        const timeout = AbortSignal.timeout.bind(AbortSignal);
+        AbortSignal.timeout = ms => { if (jsonTasks.size) window.timeoutDuringJson = true; return timeout(ms); };
         const encode = window.btoa; window.btoa = value => { mainEncodings++; return encode(value); };
         const stringify = JSON.stringify;
         JSON.stringify = (...args) => {
@@ -46,9 +87,11 @@ const server = createServer(async (req, res) => {
             if (mode === 'blocked') throw new Error('Workers blocked');
             super(url);
             this.crashed = false;
+            this.addEventListener('message', event => jsonTasks.delete(event.data.id));
           }
           postMessage(message, transfers) {
             workerOperations.push(message.operation);
+            if (message.operation === 'json') jsonTasks.add(message.id);
             if (mode === 'worker' && message.operation === 'snapshot' && workerOperations.filter(operation => operation === 'snapshot').length === 3) {
               // A later write after the acknowledgement scan has captured its
               // bytes must not be cleared by that scan's asynchronous result.
@@ -76,6 +119,24 @@ const server = createServer(async (req, res) => {
       await page.goto(`http://127.0.0.1:${server.address().port}/`);
       const frame = page.frames().find(frame => frame.url().includes('/game?'));
       await frame.waitForFunction(() => document.body.dataset.ready === 'true');
+      if (mode === 'manifest') {
+        assert.equal(binaryRequests, 2, 'duplicate/rotated content downloads only once');
+        assert.equal(uploads.length, 0);
+        assert.equal(await frame.evaluate(() => FS.readFile('/home/web_user/.renpy/game/1.save')[0]), 17);
+        assert.equal(await frame.evaluate(() => FS.readFile('/home/web_user/.renpy/game/auto-2.save').length), 800 * 1024);
+        assert.equal(await frame.evaluate(() => mainEncodings), 0, 'download encoding runs in the worker');
+        assert.ok((await frame.evaluate(() => workerOperations)).includes('download'));
+        assert.deepEqual(errors, []);
+        console.log('PASS manifest: verified binary downloads, shared-hash reuse, worker encoding');
+        await context.close(); continue;
+      }
+      if (mode === 'slow-download') {
+        assert.equal(await frame.evaluate(() => FS.readFile('/home/web_user/.renpy/game/1.save')[0]), 13);
+        assert.equal(uploads.length, 0);
+        assert.deepEqual(errors, []);
+        console.log('PASS slow-download: server progress loads after a nine-second response delay');
+        await context.close(); continue;
+      }
       await frame.evaluate(mode => {
         FS.mkdirTree('/home/web_user/.renpy/game');
         window.savedBytes = new Uint8Array((mode === 'worker' ? 12 : 1) * 1024 * 1024).fill(7);
@@ -104,7 +165,29 @@ const server = createServer(async (req, res) => {
       const metrics = await frame.evaluate(() => ({ operations: workerOperations, mainEncodings, mainLargeJson, animationTicks,
         firstByte: FS.readFile('/home/web_user/.renpy/game/1.save')[0], bytes: FS.readFile('/home/web_user/.renpy/game/1.save').length }));
       assert.equal(metrics.firstByte, expected, 'worker transfer must not detach or mutate engine memory');
+      assert.equal(await frame.evaluate(() => timeoutDuringJson), false, 'request timeout starts after JSON preparation');
       assert.ok(metrics.bytes > 0);
+      if (referenceMode) {
+        await frame.waitForFunction(() => !JSON.parse(localStorage.getItem('vnm-saves:A:X:meta')).dirty);
+        assert.ok(uploads[0].fileSnapshot); assert.equal('catalog' in uploads[0], false);
+        assert.ok(uploads[0].fileSnapshot.files.find(file => file.path.endsWith('auto-2.save')).hash);
+        const catalog = await frame.evaluate(() => new Promise((resolve, reject) => {
+          const request = indexedDB.open('vnm-save-outbox', 3);
+          request.onsuccess = () => {
+            const db = request.result, tx = db.transaction('catalogs');
+            const read = tx.objectStore('catalogs').get('vnm-saves:A:X');
+            tx.oncomplete = () => { db.close(); resolve(read.result); }; tx.onabort = () => reject(tx.error);
+          };
+        }));
+        assert.equal(catalog.baseVersionId, state.currentVersionId);
+        assert.equal(metrics.mainEncodings, 0); assert.equal(metrics.mainLargeJson, 0);
+        const before = uploads.length;
+        await page.reload();
+        const reopened = page.frames().find(frame => frame.url().includes('/game?'));
+        await reopened.waitForFunction(() => document.body.dataset.ready === 'true');
+        assert.equal(await reopened.evaluate(() => FS.readFile('/home/web_user/.renpy/game/1.save')[0]), 7);
+        assert.equal(uploads.length, before, 'reload restores the catalog without publishing an empty filesystem');
+      }
       if (mode === 'worker') {
         assert.ok(metrics.operations.includes('snapshot') && metrics.operations.includes('json'));
         assert.equal(metrics.mainEncodings, 0, 'base64 encoding belongs to the worker');

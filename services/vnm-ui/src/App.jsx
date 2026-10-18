@@ -6,6 +6,7 @@ import ErrorBoundary from './components/ErrorBoundary';
 import Navbar from './components/Navbar';
 import Library from './pages/Library';
 import Player from './pages/Player';
+import Dashboard from './pages/Dashboard';
 import BuildLog from './pages/BuildLog';
 import Gallery from './pages/Gallery';
 import Login from './pages/Login';
@@ -82,7 +83,7 @@ function RequireAdmin({ children }) {
  */
 function AppContent() {
   const { theme, toggleTheme, isDark } = useTheme();
-  const { user, logout, isAuthenticated, isAdmin } = useAuth();
+  const { user, logout, isAuthenticated, isAdmin, isOffline } = useAuth();
   const [showImportModal, setShowImportModal] = useState(false);
   const [showR2Modal, setShowR2Modal] = useState(false);
   const [showOrphanedSaves, setShowOrphanedSaves] = useState(false);
@@ -127,10 +128,11 @@ function AppContent() {
             path="/"
             element={
               <RequireAuth>
-                <Library r2Mode={r2Mode} />
+                {isOffline ? <Navigate to="/dashboard" replace /> : <Library r2Mode={r2Mode} />}
               </RequireAuth>
             }
           />
+          <Route path="/dashboard" element={<RequireAuth><Dashboard /></RequireAuth>} />
           <Route
             path="/play/:gameId"
             element={
@@ -159,7 +161,7 @@ function AppContent() {
             path="/gallery"
             element={
               <RequireAuth>
-                <Gallery r2Mode={r2Mode} />
+                {isOffline ? <Navigate to="/dashboard" replace /> : <Gallery r2Mode={r2Mode} />}
               </RequireAuth>
             }
           />

@@ -30,6 +30,7 @@ RUN save_sync_version="$(sha256sum /usr/share/nginx/html/save-sync.js | cut -d '
 
 RUN mkdir -p /web-builds /covers && \
     chown -R vnm:vnm /usr/share/nginx/html /web-builds /covers && \
+    chmod -R a+rX /usr/share/nginx/html && \
     chown -R vnm:vnm /var/cache/nginx /var/log/nginx && \
     touch /var/run/nginx.pid && chown vnm:vnm /var/run/nginx.pid
 
