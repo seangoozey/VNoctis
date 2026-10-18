@@ -18,6 +18,8 @@ from compatibility import (
 from save_metadata import prepare_save_metadata, read_save_metadata
 from build_storage import create_source_overlay, publish_build, materialize_mutable_files
 from published_assets import write_assets
+from lazy_saves import prepare_lazy_saves, publish_lazy_marker
+from offline_manifest import write_offline_manifest
 from logger import setup_logger
 
 logger = setup_logger("vnm-builder.builder")
@@ -353,6 +355,8 @@ class RenPyBuilder:
                 )
 
             metadata_file = await owned_file_work(prepare_save_metadata, build_source)
+            lazy_saves = await owned_file_work(prepare_lazy_saves, build_source, self.sdk_path)
+            await _log('[vnm-builder] Lazy save adapter: ' + ('pinned SDK supported' if lazy_saves else 'complete hydration fallback'))
             env["VNM_SAVE_METADATA"] = str(metadata_file)
 
             # ── Write progressive_download.txt for web build ──
@@ -426,6 +430,10 @@ class RenPyBuilder:
                 raise RuntimeError(
                     f"web_build completed but index.html not found in {output_dir}"
                 )
+            if lazy_saves:
+                publish_lazy_marker(index_file)
+            await _log('[vnm-builder] Preparing verified offline asset inventory...')
+            await owned_file_work(write_offline_manifest, output_dir)
             # ── Clean up redundant distributable ZIP ──────────
             # Ren'Py web_build creates a distributable .zip alongside
             # the extracted web root.  Only the extracted folder is

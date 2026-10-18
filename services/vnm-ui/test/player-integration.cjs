@@ -138,8 +138,13 @@ const server = createServer(async (request, response) => {
     const page = await context.newPage();
     const errors = []; page.on('pageerror', error => errors.push(error.message));
     await page.goto(`http://127.0.0.1:${server.address().port}/play/X`);
-    const toast = page.getByRole('status').filter({ has: page.getByRole('button', { name: 'Dismiss save sync notice' }) });
+    const toast = page.getByRole('status', { name: 'Save synchronization' });
     await toast.waitFor({ state: 'visible' });
+    const downloadNotice = page.getByRole('status', { name: 'Game download notice' });
+    if (await downloadNotice.count()) {
+      const [saveBox, downloadBox] = await Promise.all([toast.boundingBox(), downloadNotice.boundingBox()]);
+      assert.ok(downloadBox.y + downloadBox.height <= saveBox.y, 'download and save notices must not overlap');
+    }
     await toast.waitFor({ state: 'hidden', timeout: 10000 });
     const launch = new URL(await page.locator('iframe').getAttribute('src'), page.url());
     assert.ok(launch.pathname.includes('/.vnm-cache/'), 'the combined player uses retained game downloads');
@@ -157,6 +162,7 @@ const server = createServer(async (request, response) => {
     };
     await write('persistent', 'seen text'); await waitRevision(1);
     assert.equal(await toast.count(), 0, 'persistent-only upload must remain quiet');
+    await downloadNotice.waitFor({ state: 'hidden', timeout: 10000 });
     await write('1-1-LT1.save', 'numbered save'); await waitRevision(2);
     await toast.waitFor({ state: 'visible', timeout: 2000 });
     assert.match(await toast.innerText(), /Save synced/);

@@ -90,6 +90,7 @@ model SaveFileBlob {
   hash     String @id
   data     Bytes
   size     Int
+  preview  String? // Bounded presentation-only JSON, cached by immutable hash.
   files    SaveVersionFile[]
   currentFiles SaveCurrentFile[]
 }

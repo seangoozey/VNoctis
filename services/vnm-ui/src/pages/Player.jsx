@@ -6,6 +6,8 @@ import BuildProgress from '../components/BuildProgress';
 import useAuth from '../hooks/useAuth';
 import SaveSyncToast from '../components/SaveSyncToast';
 import { prepareGameCache } from '../utils/gameCache';
+import { retainGameAccess } from '../utils/offlineGames';
+import { offlineGame } from '../utils/offlineStore';
 
 /**
  * Full in-browser game player page at `/play/:gameId`.
@@ -23,9 +25,24 @@ import { prepareGameCache } from '../utils/gameCache';
  */
 export default function Player() {
   const { gameId } = useParams();
-  const { user } = useAuth();
+  const { user, isOffline } = useAuth();
   const [saveStatus, setSaveStatus] = useState('Starting save sync…');
   const [saveNoticeId, setSaveNoticeId] = useState(0);
+  const [issueNoticeId, setIssueNoticeId] = useState(0);
+  const [cacheLaunch, setCacheLaunch] = useState(null);
+  const [cacheWarning, setCacheWarning] = useState('');
+  useEffect(() => {
+    if (!cacheWarning) return;
+    const timeout = setTimeout(() => setCacheWarning(''), 8000);
+    return () => clearTimeout(timeout);
+  }, [cacheWarning]);
+  useEffect(() => {
+    const notice = event => {
+      if (event.data?.type === 'vnm-game-cache-warning' && event.data.gameId === gameId) setCacheWarning(event.data.message);
+    };
+    navigator.serviceWorker?.addEventListener('message', notice);
+    return () => navigator.serviceWorker?.removeEventListener('message', notice);
+  }, [gameId]);
   const {
     game,
     loading,
@@ -36,7 +53,6 @@ export default function Player() {
     retryBuild,
     markPlayable,
   } = useBuildStatus(gameId);
-
   // ---- iOS detection ----
   // iOS Safari does NOT support the Fullscreen API on non-<video> elements.
   // We detect it once so we can hide the fullscreen button and adjust UX.
@@ -51,11 +67,13 @@ export default function Player() {
   useEffect(() => {
     setSaveStatus('Starting save sync…');
     setSaveNoticeId(0);
+    setIssueNoticeId(0);
     const listener = event => {
       if (event.origin === window.location.origin && event.source === iframeRef.current?.contentWindow &&
           event.data?.type === 'vnm-save-status' && typeof event.data.message === 'string') {
         setSaveStatus(event.data.message);
         if (event.data.saveUploaded === true) setSaveNoticeId(value => value + 1);
+        if (Number.isSafeInteger(event.data.noticeId)) setIssueNoticeId(value => value + 1);
       }
     };
     window.addEventListener('message', listener);
@@ -166,24 +184,21 @@ export default function Player() {
   // In portrait, wait until the user explicitly taps "Continue in portrait".
   // Desktop users are virtually always landscape, so this is transparent to them.
   const wantsIframe = showIframe && (overlayDismissed || !isPortrait);
-  const [cacheLaunch, setCacheLaunch] = useState(null);
-  const [cacheWarning, setCacheWarning] = useState('');
-  const launchKey = game ? `${game.id}:${game.builtAt}:${game.webBuildPath}` : '';
+  const launchKey = game ? `${game.id}:${game.builtAt}:${game.webBuildPath}:${user?.userId}` : '';
   useEffect(() => {
     if (!wantsIframe || !game) return;
-    let cancelled = false;
-    setCacheWarning('');
-    prepareGameCache(game).catch(() => ({ src: `${game.webBuildPath}/index.html`,
-      warning: 'Game storage could not start. Downloads may not be retained this time.' }))
-      .then(result => { if (!cancelled) { setCacheLaunch({ ...result, key: launchKey }); setCacheWarning(result.warning || ''); } });
+    let cancelled = false; setCacheWarning('');
+    (async () => {
+      try {
+        const old = await offlineGame(game.id).catch(() => null);
+        const result = (isOffline || navigator.onLine === false) && old?.prepared && old.game.builtAt === game.builtAt
+          ? { src: old.scope + 'index.html' } : await prepareGameCache(game);
+        await retainGameAccess(game, user?.userId, result).catch(() => {});
+        if (!cancelled) { setCacheLaunch({ ...result, key: launchKey }); setCacheWarning(result.warning || ''); }
+      } catch { if (!cancelled) setCacheLaunch({ src: game.webBuildPath + '/index.html', key: launchKey }); }
+    })();
     return () => { cancelled = true; };
-  }, [wantsIframe, launchKey]);
-  useEffect(() => {
-    if (!navigator.serviceWorker) return;
-    const message = event => { if (event.data?.type === 'vnm-game-cache-warning' && event.data.gameId === gameId) setCacheWarning(event.data.message); };
-    navigator.serviceWorker.addEventListener('message', message);
-    return () => navigator.serviceWorker.removeEventListener('message', message);
-  }, [gameId]);
+  }, [wantsIframe, launchKey, isOffline]);
   const iframeReady = wantsIframe && cacheLaunch?.key === launchKey;
 
   // ------------------------------------------------------------------
@@ -394,11 +409,10 @@ export default function Player() {
               allow="autoplay; fullscreen"
               className="absolute inset-0 w-full h-full border-0"
             />
-            <SaveSyncToast key={gameId} message={saveStatus} saveNoticeId={saveNoticeId} />
-            {cacheWarning && <div role="status" className="absolute bottom-4 left-4 right-4 sm:left-auto sm:max-w-md rounded-lg bg-amber-950/95 text-amber-100 p-3 text-sm flex items-start gap-3">
-            <span>{cacheWarning}</span>
-            <button aria-label="Dismiss storage notice" className="shrink-0 min-w-8 min-h-8" onClick={() => setCacheWarning('')}>×</button>
-            </div>}  
+            <SaveSyncToast key={gameId} message={saveStatus} saveNoticeId={saveNoticeId} noticeId={issueNoticeId} />
+            {cacheWarning && <div role="status" aria-label="Game download notice" className="absolute z-40 top-16 left-4 right-4 sm:left-auto sm:max-w-md rounded-lg bg-amber-950/95 text-amber-100 p-3 text-sm flex items-start gap-3 shadow-lg">
+              <span>{cacheWarning}</span><button aria-label="Dismiss storage notice" className="shrink-0 min-w-[44px] min-h-[44px] rounded-lg hover:bg-amber-900 focus-visible:ring-2 focus-visible:ring-amber-300" onClick={() => setCacheWarning('')}>×</button>
+            </div>}
           </>
         ) : showIframe ? (
           /* Game is built & ready but the portrait overlay is still blocking.
@@ -410,7 +424,6 @@ export default function Player() {
           </div>
         ) : (
           <BuildProgress
-            gameId={gameId}
             buildState={buildState}
             gameTitle={title}
             jobId={jobId}

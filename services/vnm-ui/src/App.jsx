@@ -85,7 +85,7 @@ function RequireAdmin({ children }) {
  */
 function AppContent() {
   const { theme, toggleTheme, isDark } = useTheme();
-  const { user, logout, isAuthenticated, isAdmin } = useAuth();
+  const { user, logout, isAuthenticated, isAdmin, isOffline } = useAuth();
   const [showImportModal, setShowImportModal] = useState(false);
   const [showR2Modal, setShowR2Modal] = useState(false);
   const [showOrphanedSaves, setShowOrphanedSaves] = useState(false);
@@ -151,15 +151,15 @@ function AppContent() {
       <main className={isLoginPage || isFullscreenPage ? '' : 'pt-16'}>
         <Routes>
           <Route path="/login" element={<Login />} />
-          <Route path="/dashboard" element={<RequireAuth><Dashboard /></RequireAuth>} />
           <Route
             path="/"
             element={
               <RequireAuth>
-                <Library r2Mode={r2Mode} />
+                {isOffline ? <Navigate to="/dashboard" replace /> : <Library r2Mode={r2Mode} />}
               </RequireAuth>
             }
           />
+          <Route path="/dashboard" element={<RequireAuth><Dashboard /></RequireAuth>} />
           <Route
             path="/play/:gameId"
             element={
@@ -189,7 +189,7 @@ function AppContent() {
             path="/gallery"
             element={
               <RequireAuth>
-                <Gallery r2Mode={r2Mode} />
+                {isOffline ? <Navigate to="/dashboard" replace /> : <Gallery r2Mode={r2Mode} />}
               </RequireAuth>
             }
           />

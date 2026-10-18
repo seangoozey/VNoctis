@@ -19,6 +19,7 @@ import importRoutes from './routes/import.js';
 import internalRoutes from './routes/internal.js';
 import favoritesRoutes from './routes/favorites.js';
 import savesRoutes from './routes/saves.js';
+import offlineRoutes from './routes/offline.js';
 import usersRoutes from './routes/users.js';
 import settingsRoutes from './routes/settings.js';
 import publishRoutes from './routes/publish.js';
@@ -212,6 +213,7 @@ await fastify.register(authRoutes, { prefix: '/api/v1' });
 // ── Favorites routes (per-user) ───────────────────────────
 await fastify.register(favoritesRoutes, { prefix: '/api/v1' });
 await fastify.register(savesRoutes, { prefix: '/api/v1' });
+await fastify.register(offlineRoutes, { prefix: '/api/v1' });
 
 // ── User management routes (admin-only) ───────────────────
 await fastify.register(usersRoutes, { prefix: '/api/v1' });
@@ -296,16 +298,6 @@ fastify.addHook('onRequest', async (request, reply) => {
     reply.code(401).send({ code: 'UNAUTHORIZED', message: 'Invalid or expired token' });
     return;
   }
-});
-
-// Public build identity for already-public web assets. No user or save data.
-fastify.get('/api/v1/games/:gameId/cache-build', async (request, reply) => {
-  reply.header('Cache-Control', 'no-store');
-  if (!/^[a-f0-9]{32}$/.test(request.params.gameId)) return reply.code(404).send({ message: 'Game not found' });
-  const game = await prisma.game.findUnique({ where: { id: request.params.gameId },
-    select: { builtAt: true, webBuildPath: true, buildStatus: true } });
-  if (!game?.builtAt || !game.webBuildPath) return reply.code(404).send({ message: 'Build not found' });
-  return { version: game.builtAt.toISOString(), path: game.webBuildPath, status: game.buildStatus };
 });
 
 // ── Global error handler ─────────────────────────────────

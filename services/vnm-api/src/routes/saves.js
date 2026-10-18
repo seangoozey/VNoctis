@@ -1,4 +1,7 @@
 import { createHash } from 'node:crypto';
+import { currentFile, currentManifest } from '../services/saveManifest.js';
+import { extractSavePreview, SAVE_PREVIEW_VERSION } from '../services/savePreview.js';
+import { expandReferences, referenceSnapshot } from '../services/saveReferences.js';
 import { archive, canonical, collectBlobs, digest, ensureCurrentVersion, prepareFiles, prune, pruneAll, readCurrent, readVersion, saveChecksum, saveKind, writeCurrent, writeTransaction } from '../services/saveHistory.js';
 
 export const MAX_SNAPSHOT_BYTES = 128 * 1024 * 1024;
@@ -38,6 +41,25 @@ export function snapshotValidationError(snapshot) {
 
 export const validateSnapshot = snapshot => snapshotValidationError(snapshot) === null;
 
+export function validateReferenceSnapshot(copy) {
+  if (!copy || copy.version !== 1 || !Array.isArray(copy.files) || copy.files.length > 4096 ||
+      !(copy.baseVersionId === null || typeof copy.baseVersionId === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(copy.baseVersionId))) return false;
+  let total = 0;
+  for (const file of copy.files) {
+    if (!file || typeof file !== 'object') return false;
+    if (Object.hasOwn(file, 'data')) {
+      if (Object.hasOwn(file, 'hash') || Object.hasOwn(file, 'size') || typeof file.data !== 'string') return false;
+      total += Buffer.byteLength(file.data, 'base64');
+    } else {
+      if (!copy.baseVersionId || typeof file.hash !== 'string' || !/^[a-f0-9]{64}$/.test(file.hash) ||
+          !Number.isSafeInteger(file.size) || file.size < 0) return false;
+      total += file.size;
+    }
+    if (total > MAX_SNAPSHOT_BYTES) return false;
+  }
+  return validateSnapshot({ version: copy.version, files: copy.files.map(file => ({ ...file, data: file.data ?? '' })) });
+}
+
 export function validateDelta(delta) {
   if (!delta || !validateSnapshot({ version: delta.version, files: delta.files }) ||
       !Array.isArray(delta.deleted) || delta.deleted.length > 4096) return false;
@@ -64,7 +86,10 @@ export default async function savesRoutes(fastify) {
     onRequest: async request => { request.saveStartedAt = performance.now(); },
     schema: { params: { type: 'object', required: ['gameId'], properties: {
       gameId: { type: 'string', minLength: 1, maxLength: 128, pattern: '^[A-Za-z0-9_-]+$' },
-    } }, querystring: { type: 'object', properties: { uploadId: { type: 'string', maxLength: 128, pattern: '^[A-Za-z0-9_-]+$' } } } },
+    } }, querystring: { type: 'object', properties: {
+      uploadId: { type: 'string', maxLength: 128, pattern: '^[A-Za-z0-9_-]+$' },
+      manifest: { type: 'string', enum: ['1'] },
+    } } },
     preHandler: async (request, reply) => {
       if (!request.user?.userId) return reply.code(401).send({ message: 'Authentication required' });
       // VNoctis shares its library with all authenticated users, including hidden games.
@@ -103,14 +128,98 @@ export default async function savesRoutes(fastify) {
       const acknowledgement = request.query.uploadId ? await tx.saveUploadReceipt.findUnique({ where: {
         userId_gameId_uploadId: { ...key, uploadId: request.query.uploadId },
       } }) : null;
-      const snapshot = state ? await readCurrent(tx, state) : null;
+      const manifest = request.query.manifest === '1' ? await currentManifest(tx, state) : undefined;
+      const referenceVersionId = request.query.manifest === '1' && state ? await ensureCurrentVersion(tx, state) : null;
+      const snapshot = manifest === undefined && state ? await readCurrent(tx, state) : null;
       return { revision: state?.revision || 0, checksum: state?.checksum, uploadId: state?.uploadId,
         deltaUploads: true,
+        previewDownloads: true,
+        referenceUploads: true,
+        ...(request.query.manifest === '1' ? { fileDownloads: true, manifest } : { snapshot }),
         saveDirectory: runtime?.directory || game?.webSaveDirectory || null,
         saveBuildVersion: game?.builtAt?.toISOString() || null,
-        currentVersionId: state?.currentVersionId, snapshot, saveChecksum: saveChecksum(snapshot || { files: [] }),
+        currentVersionId: referenceVersionId || state?.currentVersionId,
+        saveChecksum: state && manifest !== undefined ? JSON.parse(state.payload).saveChecksum || saveChecksum(JSON.parse(state.payload))
+          : saveChecksum(snapshot || { files: [] }),
         acknowledgement: acknowledgement ? receiptResponse(acknowledgement, state?.revision || 0) : null };
     });
+  });
+  const fileOptions = {
+    ...options,
+    schema: {
+      params: { type: 'object', required: ['gameId', 'hash'], properties: {
+        ...options.schema.params.properties,
+        hash: { type: 'string', pattern: '^[a-f0-9]{64}$' },
+      } },
+      querystring: { type: 'object', required: ['revision'], properties: {
+        revision: { type: 'integer', minimum: 0, maximum: 2147483647 },
+      } },
+    },
+  };
+  fastify.get('/games/:gameId/saves/files/:hash', fileOptions, async (request, reply) => {
+    const result = await writeTransaction(fastify.prisma, async tx => {
+      const state = await tx.saveSyncState.findUnique({ where: { userId_gameId: {
+        userId: request.user.userId, gameId: request.params.gameId,
+      } } });
+      if ((state?.revision || 0) !== request.query.revision) return { changed: true };
+      return { bytes: await currentFile(tx, state, request.params.hash) };
+    });
+    if (result.changed) return reply.code(409).send({ code: 'SAVE_MANIFEST_CHANGED', message: 'Server saves changed; refresh the manifest.' });
+    if (!result.bytes) return reply.code(404).send({ message: 'Save file not found.' });
+    return reply.type('application/octet-stream').header('X-Content-Type-Options', 'nosniff').send(result.bytes);
+  });
+  const previewTasks = new Map();
+  fastify.get('/games/:gameId/saves/versions/:versionId/files/:hash', {
+    ...fileOptions, schema: { params: { type: 'object', required: ['gameId', 'versionId', 'hash'], properties: {
+      ...fileOptions.schema.params.properties,
+      versionId: { type: 'string', pattern: '^[A-Za-z0-9_-]{1,128}$' },
+    } } },
+  }, async (request, reply) => {
+    const file = await writeTransaction(fastify.prisma, tx => tx.saveVersionFile.findFirst({ where: {
+      hash: request.params.hash, version: { id: request.params.versionId, userId: request.user.userId, gameId: request.params.gameId },
+    }, select: { blob: { select: { data: true } } } }));
+    if (!file) return reply.code(404).send({ message: 'Save version file not found.' });
+    return reply.type('application/octet-stream').header('X-Content-Type-Options', 'nosniff').send(Buffer.from(file.blob.data));
+  });
+  fastify.get('/games/:gameId/saves/files/:hash/preview', fileOptions, async (request, reply) => {
+    const { hash, gameId } = request.params;
+    const result = await writeTransaction(fastify.prisma, async tx => {
+      const state = await tx.saveSyncState.findUnique({ where: { userId_gameId: { userId: request.user.userId, gameId } } });
+      if ((state?.revision || 0) !== request.query.revision) return { changed: true };
+      if (!state) return {};
+      if (JSON.parse(state.payload).storage === 'blobs') {
+        // Check account/game association before consulting the shared cache.
+        const file = await tx.saveCurrentFile.findFirst({ where: { userId: request.user.userId, gameId, hash, path: { endsWith: '.save' } },
+          select: { blob: { select: { preview: true } } } });
+        if (!file) return {};
+        if (file.blob.preview) {
+          const cached = JSON.parse(file.blob.preview);
+          if (cached.version === SAVE_PREVIEW_VERSION) return { cached };
+        }
+      } else {
+        const manifest = await currentManifest(tx, state);
+        if (!manifest.files.some(file => file.hash === hash && file.path.endsWith('.save'))) return {};
+      }
+      if (previewTasks.size >= 4 && !previewTasks.has(hash)) return { busy: true };
+      return { bytes: await currentFile(tx, state, hash) };
+    });
+    if (result.changed) return reply.code(409).send({ code: 'SAVE_MANIFEST_CHANGED', message: 'Server saves changed; refresh the manifest.' });
+    if (result.busy) return reply.code(503).header('Retry-After', '1').send({ message: 'Save previews are busy; retry shortly.' });
+    if (result.cached) return result.cached;
+    if (!result.bytes) return reply.code(404).send({ message: 'Save file not found.' });
+    let task = previewTasks.get(hash);
+    if (!task) {
+      task = (async () => {
+        const preview = await extractSavePreview(result.bytes);
+        // Decompression uses libuv outside the SQLite writer transaction. The
+        // immutable blob may have been pruned meanwhile; updateMany tolerates it.
+        await writeTransaction(fastify.prisma, tx => tx.saveFileBlob.updateMany({ where: { hash }, data: { preview: JSON.stringify(preview) } }));
+        return preview;
+      })();
+      previewTasks.set(hash, task);
+      task.finally(() => previewTasks.delete(hash)).catch(() => {});
+    }
+    return task;
   });
   fastify.put('/games/:gameId/saves', options, async (request, reply) => {
     const timings = {};
@@ -122,27 +231,31 @@ export default async function savesRoutes(fastify) {
       measuredAt = now;
     };
     mark('beforeHandlerMs');
-    const { revision, snapshot, delta, uploadId = null, baseSaveChecksum = null, alternate = false, branchId = null, deviceLabel = 'Browser' } = request.body || {};
+    const { revision, snapshot, delta, fileSnapshot, uploadId = null, baseSaveChecksum = null, alternate = false, branchId = null, deviceLabel = 'Browser' } = request.body || {};
     const incremental = delta !== undefined;
+    const referenced = fileSnapshot !== undefined, encoded = incremental || referenced;
     if (!Number.isSafeInteger(revision) || revision < 0 || revision >= 2147483647 ||
-        (incremental ? snapshot !== undefined || !validateDelta(delta) || uploadId === null : !validateSnapshot(snapshot)) ||
+        (referenced ? snapshot !== undefined || incremental || uploadId === null || !validateReferenceSnapshot(fileSnapshot)
+          : incremental ? snapshot !== undefined || !validateDelta(delta) || uploadId === null : !validateSnapshot(snapshot)) ||
         (uploadId !== null && (typeof uploadId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(uploadId))) ||
         (baseSaveChecksum !== null && (typeof baseSaveChecksum !== 'string' || !/^[a-f0-9]{64}$/.test(baseSaveChecksum))) ||
         (branchId !== null && (typeof branchId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(branchId))) ||
         typeof alternate !== 'boolean' || typeof deviceLabel !== 'string' || !deviceLabel || deviceLabel.length > 80 || /[\x00-\x1f]/.test(deviceLabel)) {
-      return reply.code(400).send((incremental ? snapshotValidationError({ version: delta?.version, files: delta?.files }) : snapshotValidationError(snapshot)) ||
+      return reply.code(400).send((referenced ? null : incremental ? snapshotValidationError({ version: delta?.version, files: delta?.files }) : snapshotValidationError(snapshot)) ||
         { code: 'SAVE_INVALID_SNAPSHOT', message: 'Invalid save upload metadata or deleted file paths.' });
     }
-    let copy = incremental ? null : canonical(snapshot);
-    let payload = incremental ? null : JSON.stringify(copy);
-    let checksum = incremental ? null : createHash('sha256').update(payload).digest('hex');
+    let copy = encoded ? null : canonical(snapshot);
+    let payload = encoded ? null : JSON.stringify(copy);
+    let checksum = encoded ? null : createHash('sha256').update(payload).digest('hex');
     const deltaPayload = incremental ? JSON.stringify({ revision, delta: { ...canonical(delta), deleted: [...delta.deleted].sort() },
       baseSaveChecksum, alternate, branchId, deviceLabel }) : null;
-    const requestChecksum = incremental ? digest(deltaPayload) : checksum;
+    const referencePayload = referenced ? JSON.stringify({ revision, fileSnapshot: referenceSnapshot(fileSnapshot),
+      baseSaveChecksum, alternate, branchId, deviceLabel }) : null;
+    const requestChecksum = encoded ? digest(referencePayload || deltaPayload) : checksum;
     const key = { userId: request.user.userId, gameId: request.params.gameId };
     const id = uploadId || digest(`${revision}:${payload}`);
-    let prepared = incremental ? null : prepareFiles(copy);
-    let incomingSlots = incremental ? null : saveChecksum(copy);
+    let prepared = encoded ? null : prepareFiles(copy);
+    let incomingSlots = encoded ? null : saveChecksum(copy);
     mark('validateAndHashMs');
     const result = await writeTransaction(fastify.prisma, async tx => {
       mark('queueAndBeginMs');
@@ -151,6 +264,11 @@ export default async function savesRoutes(fastify) {
       mark('readStateMs');
       if (receipt) return receipt.checksum === requestChecksum ? receiptResponse(receipt, state?.revision || 0)
         : { error: 'Upload ID already used for different save data.' };
+      if (referenced) {
+        const expanded = await expandReferences(tx, key, fileSnapshot);
+        if (expanded.error) return expanded;
+        copy = canonical(expanded.snapshot);
+      }
       if (incremental) {
         // A patch is meaningful only against the exact acknowledged revision.
         // Reject before writing anything; the client retains its complete copy
@@ -163,6 +281,8 @@ export default async function savesRoutes(fastify) {
         for (const path of delta.deleted) files.delete(path);
         for (const file of delta.files) files.set(file.path, file);
         copy = canonical({ version: 1, files: [...files.values()] });
+      }
+      if (encoded) {
         const validationError = snapshotValidationError(copy);
         if (validationError) {
           request.log.warn({ saveValidation: { ...validationError, files: copy.files.length,
@@ -172,7 +292,7 @@ export default async function savesRoutes(fastify) {
         }
         payload = JSON.stringify(copy); checksum = digest(payload);
         prepared = prepareFiles(copy); incomingSlots = saveChecksum(copy);
-        mark('expandDeltaMs');
+        mark(referenced ? 'expandReferencesMs' : 'expandDeltaMs');
       }
       const stored = state ? JSON.parse(state.payload) : { version: 1, files: [] };
       // Compact manifests let us compare slots without reading tens of MB of
@@ -180,7 +300,7 @@ export default async function savesRoutes(fastify) {
       const previous = stored.storage === 'blobs'
         ? { files: stored.files.map(file => ({ path: file.path, data: file.hash })) } : canonical(stored);
       // Import an old acknowledged request when upgrading from the earlier bridge.
-      if (!incremental && state?.uploadId === id && (stored.storage === 'blobs' ? state.checksum : digest(JSON.stringify(previous))) === checksum) {
+      if (!encoded && state?.uploadId === id && (stored.storage === 'blobs' ? state.checksum : digest(JSON.stringify(previous))) === checksum) {
         const imported = await tx.saveUploadReceipt.create({ data: { ...key, uploadId: id, checksum,
           revision: state.revision, disposition: 'current', saveChecksum: incomingSlots } });
         return receiptResponse(imported, state.revision);
@@ -222,7 +342,7 @@ export default async function savesRoutes(fastify) {
     const totalMs = Math.round((performance.now() - startedAt) * 10) / 10;
     if (totalMs >= 500) request.log.info({ saveTiming: { totalMs, ...timings,
       files: copy?.files.length, snapshotBytes: payload ? Buffer.byteLength(payload) : 0,
-      incremental, uploadBytes: incremental ? Buffer.byteLength(deltaPayload) : Buffer.byteLength(payload),
+      incremental, referenced, uploadBytes: encoded ? Buffer.byteLength(referencePayload || deltaPayload) : Buffer.byteLength(payload),
     } }, 'Slow save upload');
     return result.error ? reply.code(result.status || 409).send({ message: result.error, code: result.code }) : result;
   });
