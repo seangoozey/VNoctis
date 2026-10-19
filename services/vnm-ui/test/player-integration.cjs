@@ -52,10 +52,27 @@ const fixture = `<!DOCTYPE html><html><head><script src="/save-sync.js"></script
   FS.syncfs(true, () => document.body.dataset.ready = 'true');
 </script></body></html>`;
 
+const backupJobs = new Map();
 const server = createServer(async (request, response) => {
   const url = new URL(request.url, 'http://localhost');
   url.pathname = url.pathname.replace(game.id, 'X');
   const json = value => { response.setHeader('Content-Type', 'application/json'); response.end(JSON.stringify(value)); };
+  if (url.pathname === '/api/v1/save-backups/exports') {
+    let body='';for await(const chunk of request)body+=chunk;const selection=JSON.parse(body);
+    const id='backup-'+(backupJobs.size+1);backupJobs.set(id,{id,status:'ready',filename:'vnoctis-backup.zip',snapshot:versions.find(version=>version.id===selection.versionId)?.snapshot});
+    return json({id,status:'ready'});
+  }
+  if(url.pathname.startsWith('/api/v1/save-backups/jobs/')){
+    const id=url.pathname.split('/')[5],job=backupJobs.get(id);
+    if(url.pathname.endsWith('/download'))return json({url:'/api/v1/save-backups/download/'+id,filename:job.filename});
+    return json(job);
+  }
+  if(url.pathname.startsWith('/api/v1/save-backups/download/')){
+    const job=backupJobs.get(url.pathname.split('/').at(-1));
+    const {snapshotZip}=await import('../src/utils/saveFiles.js');
+    response.setHeader('Content-Type','application/zip');response.setHeader('Content-Disposition','attachment; filename="vnoctis-backup.zip"');
+    return response.end(Buffer.from(await snapshotZip(job.snapshot).arrayBuffer()));
+  }
   if (url.pathname === '/api/v1/auth/me') return json({ userId: 'A', username: 'test', role });
   if (url.pathname === '/api/v1/users') return json([]);
   if (url.pathname === '/api/v1/admin/orphaned-saves') return json({ items: orphans, nextOffset: null });
@@ -208,7 +225,7 @@ const server = createServer(async (request, response) => {
     const history = page.getByRole('dialog', { name: 'Save history', exact: true });
     await history.getByText('Current', { exact: true }).waitFor();
     const archiveDownload = page.waitForEvent('download');
-    await history.getByRole('button', { name: 'Download', exact: true }).last().click();
+    await history.getByRole('button', { name: 'Download backup', exact: true }).last().click();
     const archiveFile = await archiveDownload;
     if (process.env.ZIP_PATH) await archiveFile.saveAs(process.env.ZIP_PATH);
     const archive = zipFiles(readFileSync(await archiveFile.path()));
@@ -263,7 +280,7 @@ const server = createServer(async (request, response) => {
     assert.equal(Buffer.from(state.snapshot.files.find(file => file.path === 'game/1.save').data, 'base64').toString(), 'imported desktop save');
     assert.equal(state.snapshot.files.some(file => file.path.endsWith('log.txt')), false);
     const importDownload = page.waitForEvent('download');
-    await history.getByRole('button', { name: 'Download', exact: true }).first().click();
+    await history.getByRole('button', { name: 'Download backup', exact: true }).first().click();
     const importedZip = zipFiles(readFileSync(await (await importDownload).path()));
     assert.equal(importedZip.get('game/1.save').toString(), 'imported desktop save');
     directoryKnown = false;

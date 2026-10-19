@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import useAuth from '../hooks/useAuth';
 import api from '../hooks/useApi';
+import SaveBackupModal from '../components/SaveBackupModal';
 import { listOfflineGames } from '../utils/offlineStore';
 import {
   checkOfflineGame,
@@ -109,6 +110,7 @@ function Dialog({ title: heading, onClose, children }) {
 }
 export default function Dashboard() {
   const { user, isOffline } = useAuth();
+  const [backupOpen, setBackupOpen] = useState(false);
   const [games, setGames] = useState([]),
     [rows, setRows] = useState([]),
     [loading, setLoading] = useState(true),
@@ -514,6 +516,12 @@ export default function Dashboard() {
           )}
         </div>
       </section>
+      <section className="rounded-xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 p-4 sm:p-6 space-y-3">
+        <h2 className="text-lg font-semibold">Save backups</h2>
+        <p className="text-sm text-gray-500 dark:text-gray-400">Export or import synced saves and history across all games. Missing games retain their saves for later installation.</p>
+        <button className={primary} disabled={isOffline} onClick={()=>setBackupOpen(true)}>Manage save backups</button>
+      </section>
+      {backupOpen&&<SaveBackupModal onClose={()=>setBackupOpen(false)}/>}
       {modal?.type === 'prepare' && (
         <Dialog
           title="Prepare a game for offline play"

@@ -54,6 +54,18 @@ model User {
   saveVersions SaveVersion[]
   saveReceipts SaveUploadReceipt[]
   saveDirectories SaveRuntimeDirectory[]
+  saveIdentities SaveGameIdentity[]
+}
+
+// Identity survives absent games so backups can be restored before game import.
+model SaveGameIdentity {
+  userId String
+  gameId String
+  directoryName String?
+  gameTitle String
+  saveDirectory String?
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  @@id([userId, gameId])
 }
 
 // Runtime metadata is independent of snapshots: launching need not create a save.

@@ -639,6 +639,68 @@ worker processing, writes during preparation/acknowledgement, retained engine
 buffers, and blocked/crashed worker fallback. Set `PLAYWRIGHT_CHANNEL=chrome`
 to use an installed Chrome instead of Playwright's bundled Chromium.
 
+## Portable save backups
+
+Save History **Download backup** exports a selected snapshot as a VNoctis ZIP.
+Use **Import backup ZIP** in that game's Save History to restore it. These ZIPs
+are intended for reimport into VNoctis; desktop-game compatibility is not
+guaranteed. Native folder/file import remains available separately. Older raw
+Save History ZIPs are also accepted, with an explicit destination game.
+
+Dashboard **Save backups** exports the signed-in account's current saves and
+retained history across all games. Administrators can select **All users** for
+backup and restore. A versioned manifest records source accounts, game identities,
+runtime save directories, current snapshots, history metadata and file hashes.
+Original binary bytes, including persistent data and signing keys, are stored
+once per SHA-256 hash. Keep the ZIP intact rather than extracting it. Backup
+files contain private progress and signing keys; they contain no account
+passwords, roles, game assets or unsynced browser-only progress.
+
+Import first verifies the entire ZIP in a worker, then shows a review before
+writing saves. Personal imports always target the signed-in account. An admin
+restore matches existing usernames and allows explicit account mappings; missing
+users are created as viewers with random, unknown passwords. Set their passwords
+through Users after restoring. Existing account passwords and roles stay intact.
+Source user IDs are never used as destination IDs merely because they match.
+
+Games match their stable directory-derived identity, never just a display title.
+Missing games retain their saves and directory metadata in `SaveGameIdentity`,
+which has no Game foreign key. They remain exportable and become available when
+the corresponding game is installed under the same directory name. A changed
+server root does not matter; a renamed game directory requires explicit mapping.
+For example, restoring all saves into an empty library, installing games one and
+two later and never installing game three retains all three games' saves. User
+ownership remains attached to the reviewed destination accounts throughout.
+Explicit mapping to a game with a different known runtime save directory remaps
+that path prefix without changing file contents.
+
+Existing current progress is kept by default while backup versions enter history.
+An explicit replacement preserves the old current version first. If current
+progress changes after review, the newer progress wins and the import reports
+that the backup is available in history. Close affected games before restoring.
+Imports commit in bounded per-version/per-game transactions; a partial failure
+reports affected games rather than undoing successful records. Reimporting the
+same package deduplicates its historical versions. Normal history retention
+applies afterward; this is not an unlimited-history storage mode.
+
+The `/api/v1/save-backups` routes create background tasks for exports and import
+verification/application. Bulk export uses a consistent SQLite backup; a single
+snapshot uses a bounded read transaction. ZIP I/O and verification run in Node
+workers, and downloads stream natively without buffering the archive in browser
+JavaScript. A short-lived, one-use download capability replaces JWTs in download
+URLs. Job ownership and current administrator privileges are checked server-side.
+Completed downloads and reviewed imports survive API restarts; interrupted work
+is marked interrupted and can be started again. Import application is not blindly
+replayed after a restart.
+
+Temporary ZIPs, verified blobs and task records live under `/data/save-backups`
+(`SAVE_BACKUP_PATH` can override this) and expire after 24 hours. Removing a
+completed task removes only those temporary files, not restored saves. Ensure
+space for the SQLite snapshot, ZIP and import staging. The supported limits are
+16 GiB per ZIP, 128 MiB per snapshot, 4,096 files per snapshot, 200,000 unique
+files, 10,000 game/account records and 50,000 historical versions. Exceeding a
+limit fails the task with an error rather than silently dropping data.
+
 ## Separate upstream issue
 
 The existing migration history lacks the Game `publishStatus`, `publishedAt`, and

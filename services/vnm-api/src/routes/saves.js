@@ -124,6 +124,7 @@ export default async function savesRoutes(fastify) {
       } });
       const key = { userId: request.user.userId, gameId: request.params.gameId };
       const runtime = await tx.saveRuntimeDirectory.findUnique({ where: { userId_gameId: key } });
+      const identity = await tx.saveGameIdentity.findUnique({ where: { userId_gameId: key } });
       const game = await tx.game.findUnique({ where: { id: key.gameId }, select: { webSaveDirectory: true, builtAt: true } });
       const acknowledgement = request.query.uploadId ? await tx.saveUploadReceipt.findUnique({ where: {
         userId_gameId_uploadId: { ...key, uploadId: request.query.uploadId },
@@ -136,7 +137,7 @@ export default async function savesRoutes(fastify) {
         previewDownloads: true,
         referenceUploads: true,
         ...(request.query.manifest === '1' ? { fileDownloads: true, manifest } : { snapshot }),
-        saveDirectory: runtime?.directory || game?.webSaveDirectory || null,
+        saveDirectory: runtime?.directory || game?.webSaveDirectory || identity?.saveDirectory || null,
         saveBuildVersion: game?.builtAt?.toISOString() || null,
         currentVersionId: referenceVersionId || state?.currentVersionId,
         saveChecksum: state && manifest !== undefined ? JSON.parse(state.payload).saveChecksum || saveChecksum(JSON.parse(state.payload))
@@ -360,6 +361,7 @@ export default async function savesRoutes(fastify) {
         skip: request.query.offset, take: 51, select: { id: true, kind: true, alternate: true, baseRevision: true,
           revision: true, deviceLabel: true, createdAt: true, byteSize: true, restoredFrom: true } });
       const runtime = await tx.saveRuntimeDirectory.findUnique({ where: { userId_gameId: key } });
+      const identity = await tx.saveGameIdentity.findUnique({ where: { userId_gameId: key } });
       const game = await tx.game.findUnique({ where: { id: key.gameId }, select: { webSaveDirectory: true, builtAt: true } });
       // Persistent data exists before the first slot is saved. The engine's sync
       // subdirectory is a mirror, not a separate import destination.
@@ -370,8 +372,8 @@ export default async function savesRoutes(fastify) {
       const candidates = saveFolders.filter(folder => !saveFolders.includes(folder.replace(/\/sync$/, '')) || !folder.endsWith('/sync'));
       const snapshotDirectory = candidates.length === 1 && (!game?.builtAt || state.updatedAt >= game.builtAt) ? candidates[0] : null;
       return { currentRevision: state?.revision || 0, currentVersionId,
-        saveFolders: candidates.sort(), saveDirectory: runtime?.directory || game?.webSaveDirectory || snapshotDirectory,
-        saveDirectorySource: runtime ? 'runtime' : game?.webSaveDirectory ? 'build' : snapshotDirectory ? 'snapshot' : null,
+        saveFolders: candidates.sort(), saveDirectory: runtime?.directory || game?.webSaveDirectory || identity?.saveDirectory || snapshotDirectory,
+        saveDirectorySource: runtime ? 'runtime' : game?.webSaveDirectory ? 'build' : identity?.saveDirectory ? 'backup' : snapshotDirectory ? 'snapshot' : null,
         versions: versions.slice(0, 50), nextOffset: versions.length > 50 ? request.query.offset + 50 : null };
     });
   });
@@ -391,8 +393,9 @@ export default async function savesRoutes(fastify) {
       if (receipt) return receipt.checksum === marker ? receiptResponse(receipt, state?.revision || 0) : { error: 'Upload ID already used for different save data.' };
       if (revision !== (state?.revision || 0)) return { error: 'Synced saves changed. Refresh history and review the import again.' };
       const runtime = await tx.saveRuntimeDirectory.findUnique({ where: { userId_gameId: key } });
+      const identity = await tx.saveGameIdentity.findUnique({ where: { userId_gameId: key } });
       const game = await tx.game.findUnique({ where: { id: key.gameId }, select: { webSaveDirectory: true } });
-      const destination = runtime?.directory || game?.webSaveDirectory;
+      const destination = runtime?.directory || game?.webSaveDirectory || identity?.saveDirectory;
       if (destination && snapshot.files.some(file => file.path !== 'tokens/security_keys.txt' &&
           file.path.split('/').slice(0, -1).join('/') !== destination)) {
         return { error: 'The game’s save directory changed. Refresh history and review the import destination.', status: 409 };
