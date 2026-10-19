@@ -623,6 +623,21 @@ Console warnings identify download, upload, preparation, restore, or storage
 failures without including credentials or save data. Authentication failures
 pause syncing and ask the player to sign in again.
 
+Native browser filesystem flushes share a serialized queue, including bridge
+hydration/checkpoint flushes. Consecutive pending writes coalesce into one native
+flush while every caller still receives its callback. A slot written or removed
+during an active flush retains a follow-up flush rather than losing its pending
+persistence signal. The callback-only `FS.syncfs(callback)` overload also remains
+a write flush.
+
+The pinned runtime can report `ErrnoError` 44 (missing file) when autosave rotation
+removes a path between IDBFS's local-tree scan and asynchronous reconciliation.
+A failed write flush retries up to three times with short backoff only if tracked
+filesystem writes, renames or deletions changed the tree during that attempt.
+Populate operations, unchanged missing paths, and quota/permission failures are
+not retried this way. Persistent failures still reach callers and diagnostics;
+filesystem error numbers are included even when the engine supplies no message.
+
 Routine snapshot byte comparisons, base64 encoding, and large JSON serialization
 run in a dedicated Web Worker. The bridge copies filesystem bytes on the game
 thread and transfers owned buffers, leaving engine memory intact. Writes made
