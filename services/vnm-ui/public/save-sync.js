@@ -115,7 +115,8 @@
     // Never log request bodies, save contents, or credentials.
     console.warn('[VNoctis save sync]', {
       stage: error.saveStage || stage, name: error.name || 'Error',
-      message: String(error.message || 'Unknown error').slice(0, 200),
+      message: String(error.message || (Number.isInteger(error.errno) ? `Browser filesystem error (${error.errno})` : 'Unknown error')).slice(0, 200),
+      errno: Number.isInteger(error.errno) ? error.errno : null,
       status: error.httpStatus || null, worker: Boolean(saveWorker),
     });
   }
@@ -1009,10 +1010,58 @@
     if (!fs || !window.IDBFS?.getDB) { status('Unsupported runtime — browser saves only'); return; }
     originalGetDB = IDBFS.getDB.bind(IDBFS);
     IDBFS.getDB = (name, callback) => originalGetDB(name === root ? namespace : name, callback);
-    nativeSync = fs.syncfs.bind(fs);
-    let slotFlushTimer, flushes = 0;
-    const scheduleSlotFlush = () => {
-      slotWritePending = true;
+    const engineSync = fs.syncfs.bind(fs);
+    let persistenceGeneration = 0;
+    const syncQueue = [];
+    let syncing = false;
+    const drainSync = () => {
+      if (syncing || !syncQueue.length) return;
+      syncing = true;
+      const batch = syncQueue.shift();
+      let completed = false, retries = 0;
+      const attempt = () => {
+        const capturedMutation = persistenceGeneration;
+        let returned = false;
+        const finish = error => {
+          if (returned || completed) return;
+          returned = true;
+          // The pinned runtime reports ENOENT as 44. A rotating slot can vanish
+          // between IDBFS's local-tree scan and its asynchronous reconciliation.
+          // Retry a changed tree, never quota/permission errors or an unchanged
+          // missing path, and bound retries so genuine failures still surface.
+          if (!batch.populate && error?.name === 'ErrnoError' && error.errno === 44 &&
+              capturedMutation !== persistenceGeneration && retries < 3) {
+            setTimeout(attempt, 25 * (2 ** retries++)); return;
+          }
+          completed = true;
+          try {
+            for (const callback of batch.callbacks) {
+              try { callback(error); }
+              catch (callbackError) { setTimeout(() => { throw callbackError; }, 0); }
+            }
+          } finally {
+            // Let IDBFS finish unwinding its reconcile callback before starting
+            // another transaction, including when it failed part-way through.
+            Promise.resolve().then(() => { syncing = false; drainSync(); });
+          }
+        };
+        try { engineSync(batch.populate, finish); }
+        catch (error) { finish(error); }
+      };
+      attempt();
+    };
+    // All native persistence, including bridge hydration/checkpoints, shares one
+    // queue. IDBFS reconciles an asynchronously enumerated tree and overlapping
+    // reconciliations can overwrite each other or access rotated-away slots.
+    nativeSync = (populate, callback) => {
+      const pending = syncQueue.at(-1);
+      if (!populate && pending && !pending.populate) pending.callbacks.push(callback);
+      else syncQueue.push({ populate, callbacks: [callback] });
+      drainSync();
+    };
+    let slotFlushTimer, flushes = 0, slotWriteGeneration = 0;
+    const scheduleSlotFlush = (written = true) => {
+      if (written) { slotWritePending = true; slotWriteGeneration++; }
       if (slotFlushTimer !== undefined) return;
       // Let the engine finish its synchronous writes/renames, then persist the
       // completed slot ourselves instead of waiting for its periodic syncfs.
@@ -1028,12 +1077,14 @@
     fs.close = stream => {
       const wroteSlot = initialized && !installing && (stream.flags & 3) !== 0 && isSaveSlot(stream.path);
       const result = nativeClose(stream);
+      if ((stream.flags & 3) !== 0 && typeof stream.path === 'string' && stream.path.startsWith(`${root}/`)) persistenceGeneration++;
       if (wroteSlot) { residentHashes.delete(stream.path.slice(root.length + 1)); mutationVersion++; scheduleSlotFlush(); }
       return result;
     };
     const nativeRename = fs.rename.bind(fs);
     fs.rename = (from, to) => {
       const result = nativeRename(from, to);
+      if (from.startsWith(`${root}/`) || to.startsWith(`${root}/`)) persistenceGeneration++;
       if (initialized && !installing) {
         residentHashes.delete(from.slice(root.length + 1)); residentHashes.delete(to.slice(root.length + 1));
       }
@@ -1041,18 +1092,22 @@
         if (to.startsWith(`${root}/`)) logicalCatalog.rename(from.slice(root.length + 1), to.slice(root.length + 1));
         else logicalCatalog.remove(from.slice(root.length + 1));
       }
-      if (initialized && !installing && isSaveSlot(to)) { mutationVersion++; scheduleSlotFlush(); }
+      if (initialized && !installing && (isSaveSlot(from) || isSaveSlot(to))) { mutationVersion++; scheduleSlotFlush(); }
       return result;
     };
     const nativeUnlink = fs.unlink.bind(fs);
     fs.unlink = path => {
       const result = nativeUnlink(path);
-      if (initialized && !installing && logicalCatalog && path.startsWith(`${root}/`)) {
-        residentHashes.delete(path.slice(root.length + 1)); logicalCatalog.remove(path.slice(root.length + 1));
+      if (path.startsWith(`${root}/`)) persistenceGeneration++;
+      if (initialized && !installing && path.startsWith(`${root}/`)) {
+        residentHashes.delete(path.slice(root.length + 1)); logicalCatalog?.remove(path.slice(root.length + 1));
+        if (isSaveSlot(path)) { mutationVersion++; scheduleSlotFlush(); }
       }
       return result;
     };
     fs.syncfs = (populate, callback = () => {}) => {
+      if (typeof populate === 'function') { callback = populate; populate = false; }
+      const capturedSlotGeneration = slotWriteGeneration;
       if (!populate && initialized) {
         mutationVersion++;
         meta.dirty = true;
@@ -1077,13 +1132,14 @@
         } else {
           // Start slot uploads only after their browser storage flush succeeds.
           // Persistent-only writes retain the five-second batching interval.
-          const urgent = !populate && slotWritePending;
+          const urgent = !populate && slotWritePending && capturedSlotGeneration === slotWriteGeneration;
           if (urgent) slotWritePending = false;
           callback(null);
           if (urgent) {
             if (busy) urgentUploadPending = true;
             else upload();
           }
+          if (slotWritePending && !flushes) scheduleSlotFlush(false);
         }
       });
     };

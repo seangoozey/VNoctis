@@ -20,7 +20,8 @@ function browser(server, databases, { user = 'A', game = 'X', metadata = new Map
   const events = [];
   const backups = new Map();
   let interval, offline = false, encodings = 0;
-  let nextUploadGate, nextFlushGate;
+  let nextUploadGate, nextFlushGate, nextFlushFailure;
+  let activeFlushes = 0, maxFlushes = 0, nativeFlushCalls = 0;
   let loseResponse = false;
   const listeners = new Map(); const documentListeners = new Map();
   const timers = new Map(); let timerId = 0;
@@ -40,11 +41,15 @@ function browser(server, databases, { user = 'A', game = 'X', metadata = new Map
     utime: (path, atime, mtime) => { files.get(path).mtime = mtime; },
     unlink: path => files.delete(path), rmdir: path => dirs.delete(path),
     syncfs: (populate, callback) => context.IDBFS.getDB(root, (err, db) => {
-      if (populate) {
+      activeFlushes++; nativeFlushCalls++; maxFlushes = Math.max(maxFlushes, activeFlushes);
+      const failure = nextFlushFailure || server.onNativeFlush?.(fs); nextFlushFailure = null;
+      const complete = error => { activeFlushes--; callback(failure || error); };
+      if (failure) { /* Keep the prior durable copy on a failed flush. */ }
+      else if (populate) {
         files.clear(); for (const [path, value] of db.files) { fs.mkdirTree(path.slice(0, path.lastIndexOf('/'))); files.set(path, value); }
       } else db.files = new Map(files);
       const gate = nextFlushGate; nextFlushGate = null;
-      if (gate) gate.then(() => callback(err)); else callback(err);
+      if (gate) gate.then(() => complete(err)); else complete(err);
     }),
   };
   const context = {
@@ -214,11 +219,13 @@ function browser(server, databases, { user = 'A', game = 'X', metadata = new Map
   vm.createContext(context); vm.runInContext(source, context);
   return {
     fs, statuses, events, metadata, namespace, backups, prompts, warnings, requestTimeouts,
+    flushMetrics: () => ({ active: activeFlushes, max: maxFlushes, calls: nativeFlushCalls }),
     runtime: () => context.vnmSaves,
     async loadSlot(path) { context.vnmSaves.begin(`${root}/${path}`); while (context.vnmSaves.transfer.pending) await settle(); return context.vnmSaves.transfer; },
     encodedCount: () => encodings,
     offline: value => { offline = value; },
     pauseNextUpload() { let release; nextUploadGate = new Promise(resolve => { release = resolve; }); return release; },
+    failNextFlush(error) { nextFlushFailure = error; },
     pauseNextFlushCallback() { let release; nextFlushGate = new Promise(resolve => { release = resolve; }); return release; },
     loseNextResponse() { loseResponse = true; },
     activeTimers: () => timers.size,
@@ -302,6 +309,86 @@ test('catalog-enabled sessions persist scoped state and upload mixed references 
   assert.equal(databases.get('vnm-save-outbox').files.get('catalogs:vnm-saves:B:X').files.length, 0);
 });
 
+test('browser filesystem flush bursts serialize native work and coalesce queued writes', async () => {
+  const databases = new Map(), page = browser(new Map(), databases); await page.start(); page.offline(true);
+  const before = page.flushMetrics().calls, release = page.pauseNextFlushCallback();
+  const pending = [page.flush()];
+  for (let i = 0; i < 10; i++) {
+    page.fs.mkdirTree(`${root}/game`);
+    page.fs.writeFile(`${root}/game/persistent`, Buffer.from(`preferences-${i}`));
+    pending.push(page.flush());
+  }
+  await settle();
+  const concurrent = page.flushMetrics().max;
+  release(); await Promise.all(pending);
+  assert.equal(concurrent, 1, 'IDBFS reconciliation must never overlap');
+  assert.equal(page.flushMetrics().active, 0);
+  assert.equal(page.flushMetrics().calls - before, 2, 'ten queued writes share one follow-up flush');
+  assert.equal(Buffer.from(databases.get(page.namespace).files.get(`${root}/game/persistent`).bytes).toString(), 'preferences-9');
+});
+
+test('slot writes during an active flush receive another durable flush without an engine request', async () => {
+  const databases = new Map(), page = browser(new Map(), databases); await page.start(); page.offline(true);
+  const release = page.pauseNextFlushCallback(), first = page.flush();
+  page.fs.mkdirTree(`${root}/game`); page.fs.writeFile(`${root}/game/auto-1.save`, Buffer.from('latest autosave'));
+  await new Promise(resolve => setTimeout(resolve,10));
+  release(); await first; await new Promise(resolve => setTimeout(resolve,50)); await settle();
+  assert.equal(Buffer.from(databases.get(page.namespace).files.get(`${root}/game/auto-1.save`).bytes).toString(),'latest autosave');
+  assert.equal(page.flushMetrics().max,1); assert.deepEqual(page.warnings.filter(entry=>entry[1].stage==='storage'),[]);
+});
+
+test('a rotated-away slot retries a changed filesystem before acknowledging persistence', async () => {
+  const databases = new Map(), page = browser(new Map(), databases); await page.start(); page.offline(true);
+  page.failNextFlush({name:'ErrnoError',errno:44});
+  const release = page.pauseNextFlushCallback();
+  const first = new Promise(resolve => page.fs.syncfs(false,resolve));
+  page.fs.mkdirTree(`${root}/game`); page.fs.writeFile(`${root}/game/auto-1.save`,Buffer.from('newer autosave'));
+  release(); assert.equal(await first,null); await new Promise(resolve => setTimeout(resolve,50)); await settle();
+  assert.equal(Buffer.from(databases.get(page.namespace).files.get(`${root}/game/auto-1.save`).bytes).toString(),'newer autosave');
+  assert.equal(page.flushMetrics().max,1); assert.deepEqual(page.warnings.filter(entry=>entry[1].stage==='storage'),[]);
+});
+
+test('real storage failures reach callbacks and do not prevent the next queued flush', async () => {
+  const databases = new Map(), page = browser(new Map(),databases); await page.start(); page.offline(true);
+  const before = page.flushMetrics().calls, error = new DOMException('Browser disk quota full','QuotaExceededError');
+  page.failNextFlush(error); const release=page.pauseNextFlushCallback();
+  const first=new Promise(resolve=>page.fs.syncfs(false,resolve)), next=new Promise(resolve=>page.fs.syncfs(false,resolve));
+  release(); assert.equal(await first,error); assert.equal(await next,null);
+  assert.equal(page.flushMetrics().calls-before,2,'quota failures must not be retried as rotation races');
+  assert.equal(page.warnings[0][1].name,'QuotaExceededError'); assert.equal(page.flushMetrics().max,1);
+});
+
+test('a continuously changing missing-file race stops retrying after three retries', async () => {
+  const server=new Map(),page=browser(server,new Map());await page.start();page.offline(true);page.fs.mkdirTree(`${root}/game`);
+  const before=page.flushMetrics().calls,error={name:'ErrnoError',errno:44};let mutations=0;
+  server.onNativeFlush=fs=>{fs.writeFile(`${root}/game/auto-1.save`,Buffer.from('rotation-'+(++mutations)));return error;};
+  const failure=await new Promise(resolve=>page.fs.syncfs(false,resolve));server.onNativeFlush=null;
+  assert.equal(failure,error);assert.equal(mutations,4);assert.equal(page.flushMetrics().calls-before,4);
+  assert.ok(page.warnings.some(entry=>entry[1].stage==='storage'&&entry[1].errno===44));
+  await new Promise(resolve=>setTimeout(resolve,40));await settle();assert.equal(page.flushMetrics().active,0);
+});
+
+test('unchanged missing paths remain errors with a useful filesystem error number', async () => {
+  const page=browser(new Map(),new Map()); await page.start(); page.offline(true);
+  const before=page.flushMetrics().calls,error={name:'ErrnoError',errno:44};page.failNextFlush(error);
+  assert.equal(await new Promise(resolve=>page.fs.syncfs(false,resolve)),error);
+  assert.equal(page.flushMetrics().calls-before,1);assert.equal(page.warnings[0][1].errno,44);assert.match(page.warnings[0][1].message,/44/);
+});
+
+test('queued flush requests alone cannot disguise an unchanged missing-file failure', async () => {
+  const page=browser(new Map(),new Map());await page.start();page.offline(true);
+  const before=page.flushMetrics().calls,error={name:'ErrnoError',errno:44};page.failNextFlush(error);
+  const release=page.pauseNextFlushCallback();const first=new Promise(resolve=>page.fs.syncfs(false,resolve)),next=new Promise(resolve=>page.fs.syncfs(false,resolve));
+  release();assert.equal(await first,error);assert.equal(await next,null);assert.equal(page.flushMetrics().calls-before,2);
+});
+
+test('the callback-only syncfs overload flushes without repopulating browser files', async () => {
+  const databases=new Map(),page=browser(new Map(),databases);await page.start();page.offline(true);
+  page.fs.mkdirTree(`${root}/game`);page.fs.writeFile(`${root}/game/persistent`,Buffer.from('latest preferences'));
+  await new Promise(resolve=>page.fs.syncfs(resolve));
+  assert.equal(Buffer.from(databases.get(page.namespace).files.get(`${root}/game/persistent`).bytes).toString(),'latest preferences');
+});
+
 test('an older filesystem flush callback cannot overwrite a newer saved catalog', async () => {
   const server = new Map([['A:X', { revision: 1, snapshot: { version: 1, files: [
     { path: 'game/auto-1.save', mtime: 1234, data: Buffer.from('auto').toString('base64') },
@@ -309,7 +396,7 @@ test('an older filesystem flush callback cannot overwrite a newer saved catalog'
   const databases = new Map(), page = browser(server, databases); await page.start(); page.offline(true);
   page.fs.rename(`${root}/game/auto-1.save`, `${root}/game/auto-2.save`);
   const release = page.pauseNextFlushCallback(); const oldFlush = page.flush();
-  page.fs.unlink(`${root}/game/auto-2.save`); await page.flush(); release(); await oldFlush;
+  page.fs.unlink(`${root}/game/auto-2.save`); const newFlush = page.flush(); release(); await Promise.all([oldFlush, newFlush]);
   const stored = databases.get('vnm-save-outbox').files.get('catalogs:vnm-saves:A:X');
   assert.equal(stored.files.length, 0);
 });
