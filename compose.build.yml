@@ -1,0 +1,19 @@
+# Build the checked-out source without changing compose.yml's data mounts.
+# Usage: docker compose -f compose.yml -f compose.build.yml up -d --build
+# Keep server-specific permission/resource overrides in an additional local file.
+services:
+  vnm-api:
+    image: vnoctis-vnm-api:local
+    pull_policy: never
+    build:
+      context: ./services/vnm-api
+  vnm-builder:
+    image: vnoctis-vnm-builder:local
+    pull_policy: never
+    build:
+      context: ./services/vnm-builder
+  vnm-ui:
+    image: vnoctis-vnm-ui:local
+    pull_policy: never
+    build:
+      context: ./services/vnm-ui

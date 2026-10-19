@@ -14,6 +14,14 @@
 
 ---
 
+## Independently maintained fork
+
+This is [seangoozey's VNoctis fork](https://github.com/seangoozey/VNoctis), based on
+[starrlord/VNoctis](https://github.com/starrlord/VNoctis). The VNoctis name is retained.
+`main` contains the integrated save sync, backups, offline/cache, compatibility
+and background-job work. New development branches start from this repository's
+`main`. See [fork development and migration](docs/fork-development.md).
+
 ## 📖 Overview
 
 **VNoctis Manager** is a self-hosted, Docker-based web application for managing, building, and playing [Ren'Py](https://www.renpy.org/) visual novels directly in your browser. Point it at a directory of Ren'Py games and get a **Netflix-style browsable library** enriched with metadata from [VNDB](https://vndb.org/), one-click WebAssembly builds, and an in-browser player — all behind a single `docker compose up`.
@@ -47,7 +55,10 @@
 - **Image Compression** — Automatic lossy recompression of JPEG, PNG, and WebP images during web builds using a symlink overlay — original game files are never modified, web builds are 30–60% smaller
 - **Pre-built ZIP Import** — Drop a pre-built web distribution `.zip` into a game directory and the scanner auto-detects, extracts, and marks it as built — no rebuild needed; a **"Mark as Playable"** fallback button lets you bypass the build system entirely for manually extracted web builds
 - **Game Import via UI** — Upload a `.zip`, `.tar.bz2`, or `.rar` game archive or paste a remote URL — with real-time progress bars, drag-and-drop, and automatic extraction into the games directory
-- **In-Browser Player** — Full-screen iframe player with chrome bar, orientation hints for mobile, and a save warning toast; on iOS (iPhone/iPad) the chrome bar is replaced with a minimal floating "← Library" pill overlay that auto-fades to maximise gameplay viewport
+- **Save Sync and History** — Per-user/per-game progress, offline recovery, retained save versions and restore controls; see [save synchronization](docs/save-sync.md).
+- **Save Backups** — Reimportable VNoctis snapshot ZIPs, personal bulk backups and reviewed administrator migrations across users, including games not yet installed.
+- **Game Caching and Offline Preparation** — Reuse downloaded game assets and manage per-account offline preparation from the dashboard; see [download storage](docs/game-download-storage.md).
+- **In-Browser Player** — Full-screen iframe player with chrome bar, orientation hints for mobile, and save synchronization notices; on iOS (iPhone/iPad) the chrome bar is replaced with a minimal floating "← Library" pill overlay that auto-fades to maximise gameplay viewport
 - **Metadata Management** — Edit metadata manually, refresh from VNDB or Steam, force-link or unlink VNDB / Steam IDs via tabbed search with autocomplete, custom covers via URL
 - **Dark / Light Theme** — System-aware theme toggle with manual override, animated star-field background on build screens and library (dark mode), fully responsive from mobile to desktop
 - **Multi-User Authentication** — Database-backed user accounts with bcrypt password hashing, two roles (`admin` / `viewer`), persistent JWT sessions with `userId` + `role`, automatic session validation, login rate limiting, and an admin user management panel for creating, editing, and deleting accounts
@@ -97,9 +108,13 @@ The stack consists of three Docker services communicating over an internal bridg
 
 ### Using pre-built images (recommended)
 
+For the first setup of this fork, use [source builds](#building-from-source)
+until its Docker Images workflow has successfully published accessible packages.
+
 ```bash
 # 1. Clone the repository
-git clone <repo-url> && cd vn-manager
+git clone https://github.com/seangoozey/VNoctis.git
+cd VNoctis
 
 # 2. Configure environment
 cp .env.example .env
@@ -115,15 +130,19 @@ docker compose up -d
 #    Default username: admin
 ```
 
-> By default, `compose.yml` pulls the GitHub Container Registry images published from `starrlord/VNoctis`: `ghcr.io/starrlord/vnoctis-vnm-api:latest`, `ghcr.io/starrlord/vnoctis-vnm-builder:latest`, and `ghcr.io/starrlord/vnoctis-vnm-ui:latest`. Override `VNM_API_IMAGE`, `VNM_BUILDER_IMAGE`, and `VNM_UI_IMAGE` in `.env` if you want to use a fork or another registry.
+> By default, `compose.yml` pulls the GitHub Container Registry images published from `seangoozey/VNoctis`: `ghcr.io/seangoozey/vnoctis-vnm-api:latest`, `ghcr.io/seangoozey/vnoctis-vnm-builder:latest`, and `ghcr.io/seangoozey/vnoctis-vnm-ui:latest`. Override `VNM_API_IMAGE`, `VNM_BUILDER_IMAGE`, and `VNM_UI_IMAGE` in `.env` if you want to use a fork or another registry.
 
 > If the publishing workflow is enabled for the first time, the GHCR packages may need to be switched to **public** once in the package settings before anonymous `docker compose pull` works.
 
 ### Building from source
 
+Use this until this fork's images have been published, or whenever you want to
+build the checked-out source. Existing installations should first read the
+[migration notes](docs/fork-development.md#existing-server-transition).
+
 ```bash
-# Use the build-from-source compose file
-docker compose -f compose_local_build.yml up -d --build
+# Build this fork while keeping the same data mounts as compose.yml
+docker compose -f compose.yml -f compose.build.yml up -d --build
 ```
 
 > The UI will be available at **http://localhost:6773** (or whichever port you set in `HOST_PORT`).
@@ -163,9 +182,9 @@ ${VNM_ROOT}/
 
 | Variable | Default | Description |
 |---|---|---|
-| `VNM_API_IMAGE` | `ghcr.io/starrlord/vnoctis-vnm-api:latest` | Optional override for the API image used by `compose.yml` |
-| `VNM_BUILDER_IMAGE` | `ghcr.io/starrlord/vnoctis-vnm-builder:latest` | Optional override for the builder image used by `compose.yml` |
-| `VNM_UI_IMAGE` | `ghcr.io/starrlord/vnoctis-vnm-ui:latest` | Optional override for the UI image used by `compose.yml` |
+| `VNM_API_IMAGE` | `ghcr.io/seangoozey/vnoctis-vnm-api:latest` | Optional override for the API image used by `compose.yml` |
+| `VNM_BUILDER_IMAGE` | `ghcr.io/seangoozey/vnoctis-vnm-builder:latest` | Optional override for the builder image used by `compose.yml` |
+| `VNM_UI_IMAGE` | `ghcr.io/seangoozey/vnoctis-vnm-ui:latest` | Optional override for the UI image used by `compose.yml` |
 
 ### Authentication
 
