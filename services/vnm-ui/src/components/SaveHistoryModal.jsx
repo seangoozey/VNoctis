@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import api from '../hooks/useApi';
-import { importSnapshot, readSaveFolder, snapshotZip, validPath } from '../utils/saveFiles';
+import SaveBackupModal from './SaveBackupModal';
+import { exportSaveBackup } from '../utils/saveBackups';
+import { importSnapshot, readSaveFolder, validPath } from '../utils/saveFiles';
 
 const kinds = { auto: 'Autosave', manual: 'Manual / quick save', checkpoint: 'Synced checkpoint', restored: 'Restored version', imported: 'Imported saves' };
 const requestId = () => window.crypto?.randomUUID?.() || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
@@ -12,6 +14,7 @@ export default function SaveHistoryModal({ gameId, title, onClose, onPlay }) {
   const [loading, setLoading] = useState(true), [busy, setBusy] = useState(false);
   const [error, setError] = useState(''), [notice, setNotice] = useState('');
   const [confirm, setConfirm] = useState(null);
+  const [backupOpen, setBackupOpen] = useState(false);
   const [importPlan, setImportPlan] = useState(null), [folder, setFolder] = useState('');
   const folderPicker = useRef(null), filePicker = useRef(null), importRequest = useRef(null);
   const card = useRef(null), closeButton = useRef(null), restoreRequest = useRef(null), busyRef = useRef(false);
@@ -51,11 +54,9 @@ export default function SaveHistoryModal({ gameId, title, onClose, onPlay }) {
   async function download(version) {
     setBusy(true); setError('');
     try {
-      const copy = await api.get(`${base}/${version.id}`);
-      const url = URL.createObjectURL(snapshotZip(copy.snapshot));
-      const link = document.createElement('a'); link.href = url;
-      link.download = `vnoctis-saves-${gameId}-${version.id}.zip`;
-      document.body.append(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+      setNotice('Preparing a VNoctis save backup…');
+      await exportSaveBackup({gameId,versionId:version.id},{onProgress:job=>setNotice(job.progress?.stage||'Preparing backup…')});
+      setNotice('Backup download started. Keep the ZIP intact and use Import backup ZIP to restore it into VNoctis.');
     } catch (err) { setError(err.message); }
     finally { setBusy(false); }
   }
@@ -99,7 +100,7 @@ export default function SaveHistoryModal({ gameId, title, onClose, onPlay }) {
     finally { setBusy(false); }
   }
 
-  return <div data-save-history-dialog role="dialog" aria-modal="true" aria-labelledby="save-history-title"
+  return <><div data-save-history-dialog role="dialog" aria-modal="true" aria-labelledby="save-history-title"
     className="fixed inset-0 z-[60] flex items-center justify-center bg-black/60 dark:bg-black/70 backdrop-blur-sm modal-safe-pad motion-safe:animate-fade-in"
     onClick={() => { if (!busy) onClose(); }}>
     <div ref={card} onClick={event => event.stopPropagation()} className="relative w-full max-w-lg max-h-[85dvh] flex flex-col bg-white dark:bg-gray-900 rounded-xl shadow-2xl border border-gray-200 dark:border-gray-700/50 motion-safe:animate-scale-in">
@@ -110,8 +111,9 @@ export default function SaveHistoryModal({ gameId, title, onClose, onPlay }) {
       </div>
       <div className="px-6 py-4 overflow-y-auto space-y-4">
         <p className="text-sm text-gray-500 dark:text-gray-400">Your saves for this game. Older versions stay here, outside the game’s save slots.</p>
-        <p className="text-xs text-gray-500 dark:text-gray-400">Desktop saves may work when imported here. Downloaded ZIPs preserve the original save files, but may not load in the desktop game—even for the same game release—because VNoctis can use a different Ren’Py engine version. Compatibility can differ in each direction.</p>
+        <p className="text-xs text-gray-500 dark:text-gray-400">Downloaded backups are designed to be imported back into VNoctis. Keep the ZIP intact and use Import backup ZIP to restore it. Desktop-game compatibility is not guaranteed.</p>
         <div className="flex flex-wrap items-center gap-2">
+          <button disabled={busy || loading} onClick={() => setBackupOpen(true)} className="px-3 py-2 min-h-11 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium transition-colors disabled:opacity-50">Import backup ZIP</button>
           <button disabled={busy || loading} onClick={() => folderPicker.current?.click()} className="px-3 py-2 min-h-11 rounded-lg bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 text-gray-700 dark:text-white text-sm font-medium transition-colors disabled:opacity-50">Import save folder</button>
           <button disabled={busy || loading} onClick={() => filePicker.current?.click()} className="px-3 py-2 min-h-11 rounded-lg text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800 text-sm disabled:opacity-50">Choose files instead</button>
           <input ref={folderPicker} type="file" multiple webkitdirectory="" directory="" hidden aria-label="Save folder" onChange={selectImport} />
@@ -155,7 +157,7 @@ export default function SaveHistoryModal({ gameId, title, onClose, onPlay }) {
               </div>
             </div> : <div className="flex flex-wrap gap-2">
               {!current && <button disabled={busy} onClick={() => { restoreRequest.current = null; setConfirm({ id: version.id, action: 'restore' }); }} className="px-3 py-2 min-h-11 rounded-lg bg-emerald-600 text-white text-sm disabled:opacity-50">Restore</button>}
-              <button disabled={busy} onClick={() => download(version)} className="px-3 py-2 min-h-11 rounded-lg bg-gray-100 dark:bg-gray-800 text-sm disabled:opacity-50">Download</button>
+              <button disabled={busy} onClick={() => download(version)} className="px-3 py-2 min-h-11 rounded-lg bg-gray-100 dark:bg-gray-800 text-sm disabled:opacity-50" title="Download a backup for restoring into VNoctis">Download backup</button>
               {!current && <button disabled={busy} onClick={() => setConfirm({ id: version.id, action: 'delete' })} className="px-3 py-2 min-h-11 rounded-lg text-red-600 dark:text-red-400 text-sm disabled:opacity-50">Delete</button>}
             </div>}
           </div>;
@@ -172,5 +174,5 @@ export default function SaveHistoryModal({ gameId, title, onClose, onPlay }) {
         </>}
       </div>
     </div>
-  </div>;
+  </div>{backupOpen && <SaveBackupModal gameId={gameId} title={title} onImported={()=>load()} onClose={()=>{setBackupOpen(false);load();}}/>}</>;
 }
