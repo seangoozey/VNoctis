@@ -7,6 +7,7 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from compatibility import (
     create_uncompressed_overlay, needs_legacy_image_lookup, prepare_build_overlay,
+    adapt_legacy_urlopen_imports,
 )
 
 
@@ -56,6 +57,52 @@ class CompatibilityTests(unittest.TestCase):
             self.assertEqual((source / "progressive_download.txt").read_text(), "original rules")
             self.assertTrue((overlay / "game/images/movie.webm").is_symlink())
             self.assertFalse((source / "game/_vnm_legacy_search_prefixes.rpy").exists())
+
+    def test_urlopen_adaptation_preserves_original_and_forces_recompilation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source"
+            (source / "game").mkdir(parents=True)
+            script = source / "game/apo.rpy"
+            original = (b"\xef\xbb\xbfinit python:\r\n"
+                        b"    from urllib2 import urlopen # legacy\r\n"
+                        b"    def check_pass():\r\n        return False\r\n")
+            script.write_bytes(original)
+            compiled = script.with_suffix(".rpyc")
+            compiled.write_bytes(b"old bytecode")
+            overlay = Path(directory) / "overlay"
+            create_uncompressed_overlay(str(source), str(overlay))
+            self.assertEqual(adapt_legacy_urlopen_imports(str(overlay), "8.5.2"), ["game/apo.rpy"])
+            self.assertEqual(script.read_bytes(), original)
+            self.assertEqual(compiled.read_bytes(), b"old bytecode")
+            self.assertEqual((overlay / "game/apo.rpy").read_bytes(),
+                             original.replace(b"urllib2", b"urllib.request"))
+            self.assertFalse((overlay / "game/apo.rpyc").exists())
+            self.assertEqual(adapt_legacy_urlopen_imports(str(overlay), "8.5.2"), [])
+
+    def test_urlopen_adaptation_leaves_python2_and_unknown_sdks_alone(self):
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "game/apo.rpy"
+            script.parent.mkdir()
+            original = "init python:\n    from urllib2 import urlopen\n"
+            script.write_text(original)
+            for version in ("7.5.1", "unknown"):
+                self.assertEqual(adapt_legacy_urlopen_imports(directory, version), [])
+                self.assertEqual(script.read_text(), original)
+
+    def test_urlopen_adaptation_ignores_text_and_other_import_forms(self):
+        with tempfile.TemporaryDirectory() as directory:
+            game = Path(directory) / "game"
+            game.mkdir()
+            script = game / "script.rpy"
+            original = ("init python:\n"
+                        "    # from urllib2 import urlopen\n"
+                        "    message = \"\"\"\n    from urllib2 import urlopen\n    \"\"\"\n"
+                        "    from urllib2 import urlopen, Request\n"
+                        "    from urllib2 import urlopen as fetch\n"
+                        "    from urllib.request import urlopen\n")
+            script.write_text(original)
+            self.assertEqual(adapt_legacy_urlopen_imports(directory, "8.5.2"), [])
+            self.assertEqual(script.read_text(), original)
 
     def test_existing_compressed_assets_are_preserved(self):
         with tempfile.TemporaryDirectory() as directory:

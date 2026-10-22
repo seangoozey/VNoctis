@@ -1,9 +1,11 @@
 """Preserve known native engine defaults in a temporary web build overlay."""
 
 import ast
+import io
 import os
 import re
 import shutil
+import tokenize
 from pathlib import Path
 
 
@@ -72,3 +74,53 @@ def prepare_build_overlay(overlay_path: str, legacy_image_lookup: bool) -> None:
             raise RuntimeError(f"Reserved compatibility script already exists: {shim.name}")
         shim.parent.mkdir(parents=True, exist_ok=True)
         shim.write_text(_SHIM, encoding="utf-8")
+
+
+def adapt_legacy_urlopen_imports(overlay_path: str, sdk_version: str) -> list[str]:
+    """Translate only standalone urllib2.urlopen imports in owned game scripts.
+
+    Token inspection avoids changing dialogue, comments or multiline strings.
+    This does not emulate networking or rewrite other Python 2 interfaces.
+    """
+    major = sdk_version.split(".", 1)[0]
+    if not major.isdigit() or int(major) < 8:
+        return []
+    overlay = Path(overlay_path)
+    changed = []
+    for path in sorted((overlay / "game").rglob("*.rpy")):
+        raw = path.read_bytes()
+        try:
+            source = raw.decode("utf-8-sig")
+            tokens = list(tokenize.generate_tokens(io.StringIO(source).readline))
+        except (UnicodeError, tokenize.TokenError, IndentationError, SyntaxError):
+            continue
+        lines = source.splitlines(keepends=True)
+        replacements = []
+        for index in range(len(tokens) - 4):
+            group = tokens[index:index + 4]
+            if ([t.type for t in group] != [tokenize.NAME] * 4
+                    or [t.string for t in group] != ["from", "urllib2", "import", "urlopen"]):
+                continue
+            first, module, _, last = group
+            if first.start[0] != last.end[0]:
+                continue
+            line = lines[first.start[0] - 1]
+            if line[:first.start[1]].strip():
+                continue
+            if tokens[index + 4].type not in (tokenize.COMMENT, tokenize.NEWLINE):
+                continue
+            replacements.append(module)
+        if not replacements:
+            continue
+        for token in reversed(replacements):
+            row = token.start[0] - 1
+            lines[row] = lines[row][:token.start[1]] + "urllib.request" + lines[row][token.end[1]:]
+        # Detach links even when called independently of overlay preparation.
+        if path.is_symlink():
+            path.unlink()
+        encoding = "utf-8-sig" if raw.startswith(b"\xef\xbb\xbf") else "utf-8"
+        path.write_bytes("".join(lines).encode(encoding))
+        # Force recompilation; archived bytecode may otherwise take precedence.
+        path.with_suffix(".rpyc").unlink(missing_ok=True)
+        changed.append(path.relative_to(overlay).as_posix())
+    return changed
