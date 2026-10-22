@@ -13,7 +13,7 @@ import httpx
 
 from compressor import create_compressed_overlay, cleanup_overlay
 from compatibility import (
-    needs_legacy_image_lookup, prepare_build_overlay,
+    needs_legacy_image_lookup, prepare_build_overlay, adapt_legacy_urlopen_imports,
 )
 from save_metadata import prepare_save_metadata, read_save_metadata
 from build_storage import create_source_overlay, publish_build, materialize_mutable_files
@@ -341,7 +341,7 @@ class RenPyBuilder:
                     build_source = str(overlay_dir)
             else:
                 await _log("[vnm-builder] Asset compression skipped (user opted out)")
-                await owned_file_work(create_source_overlay, game_path, str(overlay_dir))
+                await self._prepare_archives(job_id, game_path, overlay_dir, _log, log_file)
                 build_source = str(overlay_dir)
 
             # Both compatibility and metadata hooks share the same disposable
@@ -352,6 +352,13 @@ class RenPyBuilder:
             if legacy_image_lookup:
                 await _log(
                     "[vnm-builder] Compatibility: preserving native images/ asset lookup fallback"
+                )
+
+            adapted_imports = await owned_file_work(adapt_legacy_urlopen_imports, build_source, self.sdk_version)
+            for script in adapted_imports:
+                await _log(
+                    f"[vnm-builder] Compatibility: {script}: urllib2.urlopen import "
+                    "-> urllib.request.urlopen (no network emulation)"
                 )
 
             metadata_file = await owned_file_work(prepare_save_metadata, build_source)
