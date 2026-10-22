@@ -38,6 +38,9 @@ model Game {
   metadataFetchedAt DateTime?                             // Last VNDB fetch time
   createdAt         DateTime       @default(now())
   updatedAt         DateTime       @updatedAt
+  patchRevision     Int            @default(0)
+  builtPatchRevision Int           @default(0)
+  patches           GamePatch[]
   favoritedBy       UserFavorite[]                        // Per-user favorites (replaces global favorite)
   saveDirectories  SaveRuntimeDirectory[]
 }
@@ -250,4 +253,16 @@ model PublishJob {
   completedAt   DateTime?
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
+}
+
+model GamePatch {
+  id String @id
+  gameId String
+  name String
+  enabled Boolean @default(true)
+  position Int
+  manifest String
+  createdAt DateTime @default(now())
+  game Game @relation(fields: [gameId], references: [id], onDelete: Cascade)
+  @@index([gameId, position])
 }

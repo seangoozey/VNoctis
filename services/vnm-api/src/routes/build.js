@@ -33,11 +33,13 @@ export default async function buildRoutes(fastify) {
     if (forceRecompress && !compressAssets) return reply.code(400).send({ message: "Force recompress requires asset compression." });
     const buildJob = await fastify.prisma.$transaction(async tx => {
       const job = await tx.buildJob.create({ data: { gameId } });
-      const claimed = await tx.game.updateMany({ where: { id: gameId, buildStatus: { notIn: ['queued', 'building'] } },
+      const claimed = await tx.game.updateMany({ where: { id: gameId, patchRevision: game.patchRevision, buildStatus: { notIn: ['queued', 'building'] } },
         data: { buildStatus: 'queued', buildJobId: job.id } });
       if (!claimed.count) throw Object.assign(new Error('Build already in progress.'), { statusCode: 409 });
+      const installedPatches = await tx.gamePatch.findMany({ where: { gameId, enabled: true }, orderBy: { position: 'asc' } });
+      const patches = installedPatches.map(patch => ({ id: patch.id, name: patch.name, files: JSON.parse(patch.manifest).files }));
       await tx.workJob.create({ data: { id: job.id, kind: 'build', ownerId: request.user?.userId, gameId,
-        title: game.vndbTitle || game.extractedTitle, input: JSON.stringify({ compressAssets, forceRecompress }) } });
+        title: game.vndbTitle || game.extractedTitle, input: JSON.stringify({ compressAssets, forceRecompress, patches, patchRevision: game.patchRevision }) } });
       return job;
     });
     await fastify.jobRunner.log(buildJob.id, '[queued] Build accepted. Preparation continues in the background.');

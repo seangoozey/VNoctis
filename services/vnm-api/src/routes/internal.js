@@ -121,6 +121,8 @@ export default async function internalRoutes(fastify) {
     }
 
     if (status === 'done') {
+      const work = await fastify.prisma.workJob.findUnique({ where: { id: jobId } });
+      gameUpdate.builtPatchRevision = work ? (JSON.parse(work.input).patchRevision || 0) : 0;
       gameUpdate.buildStatus = 'built';
       gameUpdate.builtAt = now;
       gameUpdate.webSaveDirectory = saveDirectory;

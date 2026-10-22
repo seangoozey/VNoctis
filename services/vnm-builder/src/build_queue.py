@@ -23,6 +23,7 @@ class QueuedJob:
     game_path: str
     compress_assets: bool = True
     force_recompress: bool = False
+    patches: list = field(default_factory=list)
 
 
 @dataclass
@@ -86,7 +87,7 @@ class BuildQueue:
                     self._persist(job_id, status, error="Build interrupted by worker restart. Retry to build again.")
                 self._jobs[job_id] = JobState(job_id=job_id, status=status)
                 if status == "queued":
-                    await self._queue.put(QueuedJob(job_id, record["game_id"], record["game_path"], record["compress_assets"], record.get("force_recompress", False)))
+                    await self._queue.put(QueuedJob(job_id, record["game_id"], record["game_path"], record["compress_assets"], record.get("force_recompress", False), record.get("patches", [])))
             except Exception as error:
                 logger.error("Cannot recover queue record %s: %s", path, error)
         for i in range(self.max_concurrent):
@@ -108,18 +109,19 @@ class BuildQueue:
 
     # ── Public API ─────────────────────────────────────────
 
-    async def add(self, job_id: str, game_id: str, game_path: str, compress_assets: bool = True, force_recompress: bool = False):
+    async def add(self, job_id: str, game_id: str, game_path: str, compress_assets: bool = True, force_recompress: bool = False, patches: list | None = None):
         """Enqueue a new build job."""
+        patches = json.loads(json.dumps(patches or []))
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", job_id):
             raise ValueError("Invalid build job ID")
         if job_id in self._records:
             record = self._records[job_id]
-            if (record["game_id"], record["game_path"], record["compress_assets"], record.get("force_recompress", False)) != (game_id, game_path, compress_assets, force_recompress):
+            if (record["game_id"], record["game_path"], record["compress_assets"], record.get("force_recompress", False), record.get("patches", [])) != (game_id, game_path, compress_assets, force_recompress, patches or []):
                 raise ValueError("Build job ID reused for different inputs")
             return
-        self._records[job_id] = {"job_id": job_id, "game_id": game_id, "game_path": game_path, "compress_assets": compress_assets, "force_recompress": force_recompress}
+        self._records[job_id] = {"job_id": job_id, "game_id": game_id, "game_path": game_path, "compress_assets": compress_assets, "force_recompress": force_recompress, "patches": patches or []}
         self._persist(job_id, "queued")
-        job = QueuedJob(job_id=job_id, game_id=game_id, game_path=game_path, compress_assets=compress_assets, force_recompress=force_recompress)
+        job = QueuedJob(job_id=job_id, game_id=game_id, game_path=game_path, compress_assets=compress_assets, force_recompress=force_recompress, patches=patches or [])
         state = JobState(job_id=job_id, status="queued")
         self._jobs[job_id] = state
         await self._queue.put(job)
@@ -229,6 +231,7 @@ class BuildQueue:
                     log_callback=_log_cb,
                     compress_assets=job.compress_assets,
                     force_recompress=job.force_recompress,
+                    **({"patches": job.patches} if job.patches else {}),
                 ))
                 result = await state.task
                 state.status = "done"

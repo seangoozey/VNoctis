@@ -492,6 +492,36 @@ If the automatic ZIP import fails (e.g., very large archives, nested ZIP structu
 
 ---
 
+## 🩹 Patches and Mods
+
+Administrators can open **Patches** in the game launcher before or after its first
+build. Upload a loose `.rpy` file or a ZIP containing scripts and assets, review
+the destination folder, replacements, instructions and exclusions, then install.
+Wrapped `game/` folders are detected; ambiguous layouts require a folder choice.
+Paired source/compiled scripts use the source and are recompiled by the SDK.
+Compiled-only patches remain dependent on their original engine version.
+
+Enable, disable, reorder or remove installed packages from the same window.
+Later enabled patches take precedence. Changes require a build/rebuild and are
+locked while a build is queued or running. Patches are applied in temporary build
+overlays before compression; original game files stay untouched and an existing
+playable build remains available until replacement succeeds.
+
+Uploads are limited to 256 MiB, with 512 MiB extracted and 10,000 archive entries.
+Only `.rpy` and ZIP uploads are supported; installers, nested archives, engine
+replacements and patches requiring file deletions need manual handling. Inspection
+checks paths, collisions, integrity and limits, but cannot establish game/version
+compatibility. Test the rebuilt game before relying on it.
+
+Patch metadata lives in the application database and package files in
+`${VNM_ROOT}/web-builds/.vnm-patches/`, which Nginx blocks from public access. Include
+both in a full application backup; save backup ZIPs do not include patches.
+Removing a patch removes its package files after the configuration update;
+unfinished previews are cleaned on later uploads after 24 hours. Failed build
+retries capture the current patch configuration.
+
+---
+
 ## 🗜️ Image Compression (Web Builds)
 
 When building a web distribution, the builder can compress images to reduce the final download size served to browsers. A **"Build Options"** dialog appears when you click Build or Rebuild, letting you choose whether to compress assets for each build.
@@ -693,6 +723,17 @@ are documented in the linked feature guides and route implementations.
 | `GET` | `/build/:jobId/log` | admin | Legacy authenticated SSE build-log stream; current UI uses `/jobs/:id/log` |
 | `DELETE` | `/build/:jobId` | admin | Cancel a queued or in-progress build |
 | `GET` | `/health` | — | Service health check (database, builder, library stats) |
+
+### Patches (admin)
+
+| Method | Endpoint | Description |
+|---|---|---|
+| GET | `/games/:gameId/patches` | Installed packages, order, revision and rebuild state |
+| POST | `/games/:gameId/patches/preview` | Upload and inspect a `.rpy` or ZIP package |
+| POST | `/games/:gameId/patches/:packageId/preview` | Preview a selected package folder |
+| POST | `/games/:gameId/patches` | Confirm installation at the reviewed revision |
+| PUT | `/games/:gameId/patches` | Confirm complete package order and enabled state |
+| DELETE | `/games/:gameId/patches/:packageId` | Discard a draft, or remove an installed package using `?revision=` |
 
 ### Background Jobs (admin)
 

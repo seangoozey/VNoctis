@@ -1,0 +1,13 @@
+ALTER TABLE "Game" ADD COLUMN "patchRevision" INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE "Game" ADD COLUMN "builtPatchRevision" INTEGER NOT NULL DEFAULT 0;
+CREATE TABLE "GamePatch" (
+ "id" TEXT NOT NULL PRIMARY KEY,
+ "gameId" TEXT NOT NULL,
+ "name" TEXT NOT NULL,
+ "enabled" BOOLEAN NOT NULL DEFAULT true,
+ "position" INTEGER NOT NULL,
+ "manifest" TEXT NOT NULL,
+ "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ CONSTRAINT "GamePatch_gameId_fkey" FOREIGN KEY ("gameId") REFERENCES "Game" ("id") ON DELETE CASCADE ON UPDATE CASCADE
+);
+CREATE INDEX "GamePatch_gameId_position_idx" ON "GamePatch"("gameId", "position");

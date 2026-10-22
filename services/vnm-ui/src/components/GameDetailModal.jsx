@@ -5,6 +5,7 @@ import CompressionOptions from './CompressionOptions';
 import ScreenshotLightbox from './ScreenshotLightbox';
 import MetadataEditModal from './MetadataEditModal';
 import SaveHistoryModal from './SaveHistoryModal';
+import PatchManagerModal from './PatchManagerModal';
 import {
   formatRating,
   formatDate,
@@ -50,6 +51,7 @@ export default function GameDetailModal({ gameId, onClose, onDeleted, onHide, on
   const [refreshTriggered, setRefreshTriggered] = useState(false);
   const [showEditModal, setShowEditModal] = useState(false);
   const [showSaveHistory, setShowSaveHistory] = useState(false);
+  const [showPatches, setShowPatches] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [showBuildOptions, setShowBuildOptions] = useState(false);
   const [buildOptions, setBuildOptions] = useState({ compressAssets: true, forceRecompress: false, ready: false });
@@ -100,7 +102,7 @@ export default function GameDetailModal({ gameId, onClose, onDeleted, onHide, on
 
   // Focus trap & Escape key
   useEffect(() => {
-    if (showSaveHistory) return;
+    if (showSaveHistory || showPatches) return;
     previousFocusRef.current = document.activeElement;
     modalRef.current?.focus();
 
@@ -132,7 +134,7 @@ export default function GameDetailModal({ gameId, onClose, onDeleted, onHide, on
       window.removeEventListener('keydown', handleKey);
       previousFocusRef.current?.focus();
     };
-  }, [onClose, showSaveHistory]);
+  }, [onClose, showSaveHistory, showPatches]);
 
   // Action handlers
   const handlePlay = useCallback(() => {
@@ -379,6 +381,7 @@ export default function GameDetailModal({ gameId, onClose, onDeleted, onHide, on
                   )}
                 </div>
 
+                {game.patchRevision !== game.builtPatchRevision && <p className="mb-3 text-sm text-amber-700 dark:text-amber-300">Patch configuration changed. Rebuild to apply it.</p>}
                 {/* 4. Action buttons */}
                 <div className="flex flex-wrap gap-3 mb-6">
                   <button
@@ -406,6 +409,7 @@ export default function GameDetailModal({ gameId, onClose, onDeleted, onHide, on
                       </button>
                     )
                   )}
+                  {isAdmin && <button onClick={() => setShowPatches(true)} className="px-4 py-2.5 bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 text-gray-700 dark:text-white font-medium rounded-lg transition-colors duration-200 text-sm inline-flex items-center gap-1.5"><svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true"><path strokeLinecap="round" strokeLinejoin="round" d="m8 3 13 13-5 5L3 8zM7 12l2-2m3 7 2-2M9 6l9 9M6 9l9 9" /></svg>Patches</button>}
                   {/* Publish / Republish button — admin + R2 mode + game is built */}
                   {isAdmin && r2Mode && isBuilt && onPublish && (
                     <button
@@ -767,6 +771,7 @@ export default function GameDetailModal({ gameId, onClose, onDeleted, onHide, on
       )}
 
       {/* Metadata edit modal */}
+      {showPatches && isAdmin && game && <PatchManagerModal gameId={gameId} title={game.vndbTitle || game.extractedTitle} onClose={() => setShowPatches(false)} onChanged={async () => { setGame(await api.get(`/library/${gameId}`)); window.dispatchEvent(new Event('vnm:library-refresh')); }} onBuild={handleBuild} hasBuild={Boolean(game.webBuildPath)} />}
       {showSaveHistory && game && <SaveHistoryModal gameId={gameId} title={game.vndbTitle || game.extractedTitle} onClose={() => setShowSaveHistory(false)} onPlay={handlePlay} />}
       {showEditModal && game && (
         <MetadataEditModal

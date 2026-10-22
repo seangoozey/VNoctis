@@ -16,6 +16,7 @@ from compatibility import (
     needs_legacy_image_lookup, prepare_build_overlay, adapt_legacy_urlopen_imports,
 )
 from save_metadata import prepare_save_metadata, read_save_metadata
+from patches import apply_patches
 from build_storage import create_source_overlay, publish_build, materialize_mutable_files
 from published_assets import write_assets
 from lazy_saves import prepare_lazy_saves, publish_lazy_marker
@@ -253,6 +254,7 @@ class RenPyBuilder:
         log_callback,
         compress_assets: bool = True,
         force_recompress: bool = False,
+        patches: list | None = None,
     ):
         """Execute the Ren'Py web build for a game.
 
@@ -315,6 +317,9 @@ class RenPyBuilder:
             if compress_assets:
                 prepared_source = Path(f'/tmp/prepare-{job_id}')
                 await self._prepare_archives(job_id, game_path, prepared_source, _log, log_file)
+                applied = await owned_file_work(apply_patches, prepared_source, self.web_builds_path / ".vnm-patches", game_id, patches or [])
+                for name in applied:
+                    await _log(f"[vnm-builder] Applied patch: {name}")
                 try:
                     await _log("[vnm-builder] Compressing images for web build...")
                     await self._notify_api_status(job_id, "building", stage="optimizing")
@@ -342,6 +347,9 @@ class RenPyBuilder:
             else:
                 await _log("[vnm-builder] Asset compression skipped (user opted out)")
                 await self._prepare_archives(job_id, game_path, overlay_dir, _log, log_file)
+                applied = await owned_file_work(apply_patches, overlay_dir, self.web_builds_path / ".vnm-patches", game_id, patches or [])
+                for name in applied:
+                    await _log(f"[vnm-builder] Applied patch: {name}")
                 build_source = str(overlay_dir)
 
             # Both compatibility and metadata hooks share the same disposable

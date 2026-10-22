@@ -213,5 +213,5 @@ test('compression status reflects published metadata and force choice survives a
   assert.equal(response.statusCode, 400);
   response = await app.inject({ method: 'POST', url: '/api/v1/build/' + gameId, headers: admin, payload: { compressAssets: true, forceRecompress: true } });
   const work = await prisma.workJob.findUnique({ where: { id: response.json().jobId } });
-  assert.deepEqual(JSON.parse(work.input), { compressAssets: true, forceRecompress: true });
+  assert.deepEqual(JSON.parse(work.input), { compressAssets: true, forceRecompress: true, patches: [], patchRevision: 0 });
 });
