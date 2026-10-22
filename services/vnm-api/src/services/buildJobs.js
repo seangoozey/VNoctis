@@ -18,7 +18,7 @@ export function registerBuildJobs(app) {
     await context.log('[queued] Waiting for the build worker.');
     let response;
     try { response = await fetch(`${url}/build`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ jobId: job.id, gameId: job.gameId, gamePath: game.directoryPath, compressAssets: Boolean(input.compressAssets), forceRecompress: Boolean(input.forceRecompress) }),
+      body: JSON.stringify({ jobId: job.id, gameId: job.gameId, gamePath: game.directoryPath, compressAssets: Boolean(input.compressAssets), forceRecompress: Boolean(input.forceRecompress), patches: input.patches || [] }),
       signal: AbortSignal.any([context.signal, AbortSignal.timeout(15000)]) }); }
     catch (error) {
       context.signal.throwIfAborted();

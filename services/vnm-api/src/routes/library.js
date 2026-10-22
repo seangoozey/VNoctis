@@ -538,6 +538,9 @@ export default async function libraryRoutes(fastify) {
 
     // 8. Delete the Game DB record
     await fastify.prisma.game.delete({ where: { id: gameId } });
+    // Explicit library deletion also removes private patch packages and drafts.
+    try { await rm(join(webBuildsPath, '.vnm-patches', gameId), { recursive: true, force: true }); }
+    catch (error) { request.log.warn({ gameId, err: error.message }, 'Could not clean up patch packages'); }
 
     request.log.info({ gameId, title: game.extractedTitle }, 'Game fully deleted');
     reply.code(204);

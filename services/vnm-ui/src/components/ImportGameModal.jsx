@@ -1,6 +1,8 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { Link } from 'react-router-dom';
 import api from '../hooks/useApi';
+import ImportDialog from './ImportDialog';
+import ImportFileDropzone from './ImportFileDropzone';
 import { stageLabels } from '../utils/jobLog';
 
 /**
@@ -31,7 +33,6 @@ export default function ImportGameModal({ open, onClose, onImported }) {
   const [tab, setTab] = useState('file'); // 'file' | 'url'
   const [file, setFile] = useState(null);
   const [url, setUrl] = useState('');
-  const [dragOver, setDragOver] = useState(false);
   const [phase, setPhase] = useState('idle'); // idle | uploading | downloading | extracting | success | error
   const [progress, setProgress] = useState(0);
   const [downloadedBytes, setDownloadedBytes] = useState(0);
@@ -42,53 +43,9 @@ export default function ImportGameModal({ open, onClose, onImported }) {
   const [jobStage, setJobStage] = useState('queued');
   const xhrRef = useRef(null);
   const abortRef = useRef(null);
-  const modalRef = useRef(null);
   const fileInputRef = useRef(null);
-  const previousFocusRef = useRef(null);
   const importedRef = useRef(onImported);
   importedRef.current = onImported;
-
-  // Prevent body scroll while modal is open
-  useEffect(() => {
-    if (!open) return;
-    document.body.style.overflow = 'hidden';
-    return () => { document.body.style.overflow = ''; };
-  }, [open]);
-
-  // Focus trap & Escape key
-  useEffect(() => {
-    if (!open) return;
-    previousFocusRef.current = document.activeElement;
-    modalRef.current?.focus();
-
-    const handleKey = (e) => {
-      if (e.key === 'Escape' && (!isProcessing || jobId)) {
-        onClose();
-        return;
-      }
-      if (e.key === 'Tab' && modalRef.current) {
-        const focusable = modalRef.current.querySelectorAll(
-          'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
-        );
-        if (focusable.length === 0) return;
-        const first = focusable[0];
-        const last = focusable[focusable.length - 1];
-        if (e.shiftKey && document.activeElement === first) {
-          e.preventDefault();
-          last.focus();
-        } else if (!e.shiftKey && document.activeElement === last) {
-          e.preventDefault();
-          first.focus();
-        }
-      }
-    };
-
-    window.addEventListener('keydown', handleKey);
-    return () => {
-      window.removeEventListener('keydown', handleKey);
-      previousFocusRef.current?.focus();
-    };
-  }, [open, onClose, phase, jobId]);
 
   // Reset state when modal opens
   useEffect(() => {
@@ -152,26 +109,6 @@ export default function ImportGameModal({ open, onClose, onImported }) {
     }
     setFile(selectedFile);
     setErrorMsg('');
-  }, []);
-
-  const handleInputChange = useCallback((e) => {
-    handleFileSelect(e.target.files?.[0]);
-  }, [handleFileSelect]);
-
-  const handleDrop = useCallback((e) => {
-    e.preventDefault();
-    setDragOver(false);
-    handleFileSelect(e.dataTransfer.files?.[0]);
-  }, [handleFileSelect]);
-
-  const handleDragOver = useCallback((e) => {
-    e.preventDefault();
-    setDragOver(true);
-  }, []);
-
-  const handleDragLeave = useCallback((e) => {
-    e.preventDefault();
-    setDragOver(false);
   }, []);
 
   const handleRemoveFile = useCallback(() => {
@@ -336,46 +273,7 @@ export default function ImportGameModal({ open, onClose, onImported }) {
   const canSubmit = tab === 'file' ? !!file : !!url.trim();
 
   return (
-    <div
-      className="fixed inset-0 z-[55] flex items-center justify-center bg-black/60 dark:bg-black/70 backdrop-blur-sm modal-safe-pad motion-safe:animate-fade-in"
-      onClick={!isProcessing || jobId ? onClose : undefined}
-      role="dialog"
-      aria-modal="true"
-      aria-label="Import Game"
-    >
-      {/* Modal card */}
-      <div
-        ref={modalRef}
-        tabIndex={-1}
-        className="relative w-full max-w-lg bg-white dark:bg-gray-900 rounded-xl shadow-2xl border border-gray-200 dark:border-gray-700/50 motion-safe:animate-scale-in outline-none"
-        onClick={(e) => e.stopPropagation()}
-      >
-        {/* Header */}
-        <div className="flex items-center justify-between px-6 pt-5 pb-4 border-b border-gray-200 dark:border-gray-800">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-lg bg-emerald-500/10 dark:bg-emerald-500/20 flex items-center justify-center">
-              <svg className="w-5 h-5 text-emerald-600 dark:text-emerald-400" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 0 0 5.25 21h13.5A2.25 2.25 0 0 0 21 18.75V16.5m-13.5-9L12 3m0 0 4.5 4.5M12 3v13.5" />
-              </svg>
-            </div>
-            <div>
-              <h2 className="text-lg font-bold text-gray-900 dark:text-white">Import Game</h2>
-              <p className="text-xs text-gray-500 dark:text-gray-400">Upload an archive or import from URL</p>
-            </div>
-          </div>
-          {(!isProcessing || jobId) && (
-            <button
-              className="w-8 h-8 flex items-center justify-center rounded-full hover:bg-gray-100 dark:hover:bg-gray-800 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 transition-colors"
-              onClick={onClose}
-              aria-label="Close modal"
-            >
-              <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" d="M6 18 18 6M6 6l12 12" />
-              </svg>
-            </button>
-          )}
-        </div>
-
+    <ImportDialog title="Import Game" subtitle="Upload an archive or import from URL" onClose={onClose} busy={isProcessing && !jobId}>
         {/* Tab switcher — only visible in idle state */}
         {isIdle && (
           <div className="flex border-b border-gray-200 dark:border-gray-800 mx-6">
@@ -416,46 +314,7 @@ export default function ImportGameModal({ open, onClose, onImported }) {
         <div className="px-6 py-5">
           {/* ── Idle: File Tab — file picker ── */}
           {isIdle && tab === 'file' && !file && (
-            <div
-              onDrop={handleDrop}
-              onDragOver={handleDragOver}
-              onDragLeave={handleDragLeave}
-              onClick={() => fileInputRef.current?.click()}
-              className={`
-                relative flex flex-col items-center justify-center gap-3 py-12 px-6
-                border-2 border-dashed rounded-xl cursor-pointer transition-all duration-200
-                ${dragOver
-                  ? 'border-emerald-500 bg-emerald-50 dark:bg-emerald-500/10'
-                  : 'border-gray-300 dark:border-gray-600 hover:border-emerald-400 dark:hover:border-emerald-500 hover:bg-gray-50 dark:hover:bg-gray-800/50'
-                }
-              `}
-            >
-              <div className={`w-14 h-14 rounded-full flex items-center justify-center transition-colors duration-200 ${
-                dragOver ? 'bg-emerald-100 dark:bg-emerald-500/20' : 'bg-gray-100 dark:bg-gray-800'
-              }`}>
-                <svg className={`w-7 h-7 transition-colors duration-200 ${
-                  dragOver ? 'text-emerald-600 dark:text-emerald-400' : 'text-gray-400 dark:text-gray-500'
-                }`} fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M20.25 7.5l-.625 10.632a2.25 2.25 0 01-2.247 2.118H6.622a2.25 2.25 0 01-2.247-2.118L3.75 7.5m8.25 3v6.75m0 0l-3-3m3 3 3-3M3.375 7.5h17.25c.621 0 1.125-.504 1.125-1.125v-1.5c0-.621-.504-1.125-1.125-1.125H3.375c-.621 0-1.125.504-1.125 1.125v1.5c0 .621.504 1.125 1.125 1.125z" />
-                </svg>
-              </div>
-              <div className="text-center">
-                <p className="text-sm font-medium text-gray-700 dark:text-gray-300">
-                  {dragOver ? 'Drop your file here' : 'Drop archive here or click to browse'}
-                </p>
-                <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">
-                  Supports .zip, .tar.bz2, and .rar — up to 24 GB
-                </p>
-              </div>
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept=".zip,.tar.bz2,.rar"
-                onChange={handleInputChange}
-                className="hidden"
-                aria-label="Select archive file"
-              />
-            </div>
+            <ImportFileDropzone accept=".zip,.tar.bz2,.rar" hint="Supports .zip, .tar.bz2, and .rar — up to 24 GB" onSelect={handleFileSelect} inputRef={fileInputRef} />
           )}
 
           {/* ── Idle: File Tab — file selected ── */}
@@ -688,7 +547,6 @@ export default function ImportGameModal({ open, onClose, onImported }) {
             </>
           )}
         </div>
-      </div>
 
       {/* Shimmer animation for indeterminate progress bar */}
       <style>{`
@@ -697,7 +555,7 @@ export default function ImportGameModal({ open, onClose, onImported }) {
           100% { transform: translateX(400%); }
         }
       `}</style>
-    </div>
+    </ImportDialog>
   );
 }
 

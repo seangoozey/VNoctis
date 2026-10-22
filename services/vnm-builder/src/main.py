@@ -17,7 +17,7 @@ from pathlib import Path
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from builder import RenPyBuilder
 from build_queue import BuildQueue
@@ -109,6 +109,7 @@ class BuildRequest(BaseModel):
     gamePath: str
     compressAssets: bool = True
     forceRecompress: bool = False
+    patches: list[dict] = Field(default_factory=list)
 
 
 class BuildAccepted(BaseModel):
@@ -168,6 +169,7 @@ async def start_build(body: BuildRequest):
         game_path=body.gamePath,
         compress_assets=body.compressAssets,
         force_recompress=body.forceRecompress,
+        patches=body.patches,
     )
 
     return BuildAccepted(jobId=body.jobId)
