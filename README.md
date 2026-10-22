@@ -8,7 +8,6 @@
 [![Node.js](https://img.shields.io/badge/Node.js-24-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
 [![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)](https://react.dev/)
 [![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 </div>
 
@@ -29,6 +28,8 @@ and background-job work. New development branches start from this repository's
 ---
 
 ## 📸 Screenshots
+
+These screenshots show the original interface. Dashboard, Jobs and save backup controls are described below.
 
 | | |
 |:---:|:---:|
@@ -52,7 +53,7 @@ and background-job work. New development branches start from this repository's
 - **VNDB Integration** — Fuzzy-matches game directories to VNDB entries and fetches cover art, synopsis, ratings, developer, tags, screenshots, release date, and estimated play time
 - **Steam Integration** — Search the Steam catalog by name (games + DLC), link any game to a Steam app ID, and pull cover art (library capsule), description, developer, release date, genres, screenshots, and Metacritic score; locally-cached app list refreshes every 24 hours
 - **Background Imports and Builds** — Accepted imports and builds continue after closing the launcher. An admin Jobs page provides persisted progress, cancellation, retries and retained logs with reconnecting delivery and full downloads. See [background jobs](docs/background-jobs.md) for recovery and deployment details.
-- **Image Compression** — Automatic lossy recompression of JPEG, PNG, and WebP images during web builds using a symlink overlay — original game files are never modified, web builds are 30–60% smaller
+- **Image Compression** — Automatic lossy recompression of JPEG, PNG, and WebP images during web builds using a symlink overlay — original game files are never modified, unchanged optimized images can be reused on rebuilds; size savings depend on the game
 - **Pre-built ZIP Import** — Drop a pre-built web distribution `.zip` into a game directory and the scanner auto-detects, extracts, and marks it as built — no rebuild needed; a **"Mark as Playable"** fallback button lets you bypass the build system entirely for manually extracted web builds
 - **Game Import via UI** — Upload a `.zip`, `.tar.bz2`, or `.rar` game archive or paste a remote URL — with real-time progress bars, drag-and-drop, and automatic extraction into the games directory
 - **Save Sync and History** — Per-user/per-game progress, offline recovery, retained save versions and restore controls; see [save synchronization](docs/save-sync.md).
@@ -62,11 +63,11 @@ and background-job work. New development branches start from this repository's
 - **Metadata Management** — Edit metadata manually, refresh from VNDB or Steam, force-link or unlink VNDB / Steam IDs via tabbed search with autocomplete, custom covers via URL
 - **Dark / Light Theme** — System-aware theme toggle with manual override, animated star-field background on build screens and library (dark mode), fully responsive from mobile to desktop
 - **Multi-User Authentication** — Database-backed user accounts with bcrypt password hashing, two roles (`admin` / `viewer`), persistent JWT sessions with `userId` + `role`, automatic session validation, login rate limiting, and an admin user management panel for creating, editing, and deleting accounts
-- **User Management Panel** — Admin-only page for managing user accounts: create users with username/password/role, change roles (admin ↔ viewer), reset passwords, and delete accounts with cascading favorite cleanup; safety guards prevent deleting yourself or demoting the last admin
+- **User Management Panel** — Admin-only page for managing user accounts: create users with username/password/role, change roles (admin ↔ viewer), reset passwords, and delete accounts with cascading favorite and save cleanup; safety guards prevent deleting yourself or demoting the last admin
 - **Progressive Downloads** — Automatically generates `progressive_download.txt` rules so GUI images load upfront while game art, music, and voice stream on demand — existing rules in a game directory are preserved
 - **Custom Loading Screen** — Branded web presplash image automatically replaces the default Ren'Py loading screen in all web builds
 - **Cloudflare R2 Publishing** — One-click publish of built web games to Cloudflare R2 object storage with real-time SSE progress streaming, automatic static gallery generation (self-contained HTML with integrated in-browser player), publish status badges on all cards, per-game unpublish, and an admin settings modal for credentials (AES-256-GCM encrypted at rest)
-- **Docker-Native** — Single compose stack with health checks, resource limits, network isolation, and named volumes
+- **Docker-Native** — Three-service Compose stack with health checks, builder resource limits, network isolation, and bind-mounted persistent data; a legacy standalone build file uses named volumes
 
 ---
 
@@ -74,26 +75,29 @@ and background-job work. New development branches start from this repository's
 
 The stack consists of three Docker services communicating over an internal bridge network:
 
+```text
+Browser → vnm-ui (Nginx :80) → vnm-api (Fastify :3001) → vnm-builder (FastAPI :3002)
 ```
-┌─────────────┐     ┌──────────────┐     ┌──────────────┐
-│   vnm-ui    │────▶│   vnm-api    │────▶│ vnm-builder  │
-│  (nginx)    │     │  (fastify)   │     │  (fastapi)   │
-│  port 80    │     │  port 3001   │     │  port 3002   │
-└─────────────┘     └──────────────┘     └──────────────┘
-       │                   │                    │
-       ▼                   ▼                    ▼
-  /web-builds (ro)    /data (SQLite)       /web-builds
-  /covers (ro)        /covers              /games (ro)
-  /screenshots (ro)   /screenshots         /renpy-sdk (ro)
-                      /games (ro)
-                      /web-builds (ro)
-```
+
+Default mounts in `compose.yml`:
+
+| Container path | API | Builder | UI | Persistent host location |
+|---|---|---|---|---|
+| `/games` | read/write | read/write | — | `${VNM_ROOT}/games` |
+| `/web-builds` | read/write | read/write | read-only | `${VNM_ROOT}/web-builds` |
+| `/data` | read/write | logs subdirectory only | — | `${VNM_ROOT}/data` |
+| `/renpy-sdk` | — | read/write | — | `${VNM_ROOT}/renpy-sdk` |
+| `/covers`, `/screenshots` | read/write | — | read-only | Corresponding folders under `${VNM_ROOT}` |
+
+Build overlays protect source files from SDK writes; mount permissions also allow
+imports, publication and administrative deletion. The SDK mount must be writable
+for downloads and the engine's generated files. Only the UI port is published.
 
 | Service | Stack | Role |
 |---|---|---|
 | **vnm-ui** | React 19 · Vite 6 · Tailwind CSS v4 · Nginx | SPA frontend — library page, game detail modals, search/filter/sort, in-browser player |
-| **vnm-api** | Node.js 24 · Fastify 5 · Prisma · SQLite | REST API — game scanning, VNDB & Steam metadata enrichment, cover & screenshot caching, build orchestration, SSE log streaming |
-| **vnm-builder** | Python 3.11 · FastAPI | Build service — Ren'Py SDK `web_build` compilation to WebAssembly, build queue with concurrency control |
+| **vnm-api** | Node.js 24 · Fastify 5 · Prisma · SQLite | REST API — game scanning, VNDB & Steam metadata enrichment, cover & screenshot caching, durable job orchestration, save sync/history/backups and authenticated log reads |
+| **vnm-builder** | Python 3.11 · FastAPI | Build service — Ren'Py SDK `web_build`, persistent build queue, disposable overlays and CPU-aware asset optimization |
 
 ---
 
@@ -101,57 +105,74 @@ The stack consists of three Docker services communicating over an internal bridg
 
 ### Prerequisites
 
-- **Docker Engine 24+** and **Docker Compose v2**
-- **Ren'Py game directories** — each game must contain a `game/` subdirectory with `.rpy`/`.rpyc` files, or a `renpy/` directory at the game root
+- **Docker Engine 24+** and **Docker Compose v2**.
+- A host directory for games and persistent application data.
+- Ren'Py game directories containing a `game/` subdirectory or a bundled `renpy/`
+  engine, or supported archives to import through the UI.
+- **HTTPS or localhost** for service-worker caching and offline preparation.
+  Physical mobile/Safari acceptance remains pending; automated mobile checks use
+  Chrome viewport layouts.
 
-> **Note:** The **Ren'Py SDK** and **web platform** are **automatically downloaded** on first container start. No manual SDK installation is required. The SDK files are stored in the `RENPY_SDK_PATH` volume so they persist across restarts. You can change the SDK version via the `RENPY_SDK_VERSION` environment variable (default: `8.5.2`).
+The builder downloads the configured Ren'Py SDK and web platform on first start
+(default `8.5.2`) into `${VNM_ROOT}/renpy-sdk`, mounted at `/renpy-sdk` in the
+container. A first build therefore needs network access and sufficient disk space.
 
-### Using pre-built images (recommended)
-
-For the first setup of this fork, use [source builds](#building-from-source)
-until its Docker Images workflow has successfully published accessible packages.
+### Configure
 
 ```bash
-# 1. Clone the repository
 git clone https://github.com/seangoozey/VNoctis.git
 cd VNoctis
-
-# 2. Configure environment
 cp .env.example .env
-# Edit .env — set VNM_ROOT and VNM_ADMIN_PASSWORD at minimum
-
-# 3. Launch (SDK downloads automatically on first start)
-docker compose up -d
-
-# 4. Open browser
-# http://localhost:6773
-
-# 5. Log in with the credentials from your .env
-#    Default username: admin
+# Edit .env: set VNM_ROOT, VNM_ADMIN_PASSWORD and appropriate PUID/PGID values.
 ```
 
-> By default, `compose.yml` pulls the GitHub Container Registry images published from `seangoozey/VNoctis`: `ghcr.io/seangoozey/vnoctis-vnm-api:latest`, `ghcr.io/seangoozey/vnoctis-vnm-builder:latest`, and `ghcr.io/seangoozey/vnoctis-vnm-ui:latest`. Override `VNM_API_IMAGE`, `VNM_BUILDER_IMAGE`, and `VNM_UI_IMAGE` in `.env` if you want to use a fork or another registry.
+Keep `.env` and runtime data out of Git.
 
-> If the publishing workflow is enabled for the first time, the GHCR packages may need to be switched to **public** once in the package settings before anonymous `docker compose pull` works.
+### Build from source
 
-### Building from source
-
-Use this until this fork's images have been published, or whenever you want to
-build the checked-out source. Existing installations should first read the
-[migration notes](docs/fork-development.md#existing-server-transition).
+This works without published registry images and builds the checked-out version.
+The overlay preserves the base file's data mounts:
 
 ```bash
-# Build this fork while keeping the same data mounts as compose.yml
+docker compose -f compose.yml -f compose.build.yml config --quiet
 docker compose -f compose.yml -f compose.build.yml up -d --build
 ```
 
-> The UI will be available at **http://localhost:6773** (or whichever port you set in `HOST_PORT`).
+### Use published images
+
+Use this after the fork's [Docker Images workflow](https://github.com/seangoozey/VNoctis/actions/workflows/docker-images.yml)
+has successfully published accessible packages:
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+Defaults are `ghcr.io/seangoozey/vnoctis-vnm-api:latest`,
+`ghcr.io/seangoozey/vnoctis-vnm-builder:latest` and
+`ghcr.io/seangoozey/vnoctis-vnm-ui:latest`. `.env` image overrides can select a
+different tag or registry. GHCR packages must be public for anonymous pulls, or
+your Docker client must authenticate with access to them.
+
+Open **http://localhost:6773** (or your configured `HOST_PORT`) and sign in using
+the initial admin credentials from `.env`.
+
+### Existing installations
+
+Read [fork development and migration](docs/fork-development.md#existing-server-transition)
+before changing branches, images or Compose files. Preserve the current database,
+keys, game directory names and mounts. Existing TrueNAS overrides still need both
+`-f compose.yml -f compose.save-sync.yml` until their settings are migrated.
+
+`compose_local_build.yml` is the older standalone named-volume layout. Switching
+to it, or away from it, does not migrate data automatically. Keep using your
+existing Compose invocation until the storage layout has been compared.
 
 ---
 
 ## ⚙️ Configuration
 
-All configuration is managed through environment variables. Copy [`.env.example`](.env.example) to `.env` and adjust values for your setup.
+Copy [`.env.example`](.env.example) to `.env` for settings forwarded by Compose. Advanced service environment variables that are not referenced in `compose.yml` need a local Compose override. After changing container environment values, **recreate** the affected service using your existing Compose files; `restart` does not apply new `.env` values.
 
 ### Paths
 
@@ -165,11 +186,13 @@ Set **`VNM_ROOT`** to a single root directory and all sub-paths are derived auto
 ${VNM_ROOT}/
 ├── games/          # Ren'Py visual novel game directories
 ├── renpy-sdk/      # Ren'Py SDK (auto-downloaded on first start)
-├── data/           # SQLite database and persistent logs
-│   └── logs/       # vnm-api.log + vnm-builder.log
+├── data/           # SQLite database, keys, logs and job/backup staging
+│   ├── logs/       # vnm-api.log + vnm-builder.log
+│   ├── import-jobs/ # Staged uploads for background imports
+│   └── save-backups/ # Temporary backup/import tasks (24-hour expiry)
 ├── covers/         # Cached cover art images
 ├── screenshots/    # Cached VNDB screenshot images
-└── web-builds/     # Compiled web build output
+└── web-builds/     # Compiled output, retained job logs and builder queue records
 ```
 
 ### Networking
@@ -194,7 +217,23 @@ ${VNM_ROOT}/
 | `VNM_ADMIN_PASSWORD` | *(required)* | Initial admin password — used to seed the admin account on **first startup only** (stored as a bcrypt hash in the database); also used when `RESET_ADMIN_PASSWORD=true` to force-reset the admin password |
 | `VNM_JWT_SECRET` | *(auto-generated)* | JWT signing secret; auto-created and persisted to `/data/.jwt-secret` if not provided |
 | `VNM_SESSION_TTL_DAYS` | `30` | How many days login sessions remain valid before requiring re-authentication |
-| `RESET_ADMIN_PASSWORD` | `false` | Set to `true` to force-reset the initial admin account's password from `VNM_ADMIN_PASSWORD` on next startup; resets to `false` behavior after the update completes |
+| `RESET_ADMIN_PASSWORD` | `false` | Set to `true` to force-reset the initial admin account's password from `VNM_ADMIN_PASSWORD` on next startup; remove the override after recovery; this is not automatically cleared |
+
+`RESET_ADMIN_PASSWORD` is supported by the API but is not forwarded by the base
+Compose file. For recovery, set the desired `VNM_ADMIN_PASSWORD` in `.env` and
+append a temporary local override to your **existing** Compose invocation:
+
+```yaml
+# compose.admin-reset.yml
+services:
+  vnm-api:
+    environment:
+      RESET_ADMIN_PASSWORD: "true"
+```
+
+Recreate `vnm-api` with that override, verify the password, then recreate it using
+the normal invocation without the reset override. Keep any source-build and
+permission/resource overrides in both invocations.
 
 ### VNDB Integration
 
@@ -220,7 +259,8 @@ ${VNM_ROOT}/
 | `COMPRESS_JPEG_QUALITY` | `80` | JPEG quality target (0–100). Lower = smaller files, more artifacts |
 | `COMPRESS_PNG_QUALITY` | `60-80` | PNG quality range for pngquant lossy palette quantisation (min-max, 0–100) |
 | `COMPRESS_WEBP_QUALITY` | `80` | WebP quality target (0–100) |
-| `COMPRESS_WORKERS` | `0` | Parallel compression workers. `0` = auto (all available CPU cores) |
+| `COMPRESS_WEBP_METHOD` | `2` | WebP encoder effort (0–6), independent of quality; `4` restores the earlier method |
+| `COMPRESS_WORKERS` | `0` | `0` = auto within the container CPU quota/affinity. Positive values request fewer workers; concurrent builds share the allowance |
 
 ### Cloudflare R2 Publishing
 
@@ -230,6 +270,11 @@ ${VNM_ROOT}/
 
 > **Note:** R2 credentials (account ID, access key ID, secret, bucket name, public URL) are stored in the database at runtime via the admin settings page — they are **not** environment variables. The secret access key is encrypted at rest using AES-256-GCM.
 
+The builder's default Compose limits are 8 CPUs and 16 GiB memory. Adjust those
+in a local override for your host. Compression respects the container's actual
+quota/affinity rather than using every host CPU; `BUILD_CONCURRENCY` and
+`COMPRESS_WORKERS` control different levels of parallelism.
+
 ### General
 
 | Variable | Default | Description |
@@ -237,8 +282,8 @@ ${VNM_ROOT}/
 | `LOG_LEVEL` | `info` | Log verbosity (`debug`, `info`, `warn`, `error`) |
 | `LOG_PATH` | `/data/logs` | Directory for persistent log files inside the container. Both vnm-api and vnm-builder write structured JSON logs here (`vnm-api.log` and `vnm-builder.log`). Logs are also written to stdout for `docker compose logs`. |
 | `TZ` | `America/Chicago` | Container timezone |
-| `PUID` | `99` | User ID for file permission mapping on bind mounts |
-| `PGID` | `100` | Group ID for file permission mapping on bind mounts |
+| `PUID` | `99` | API user ID for bind-mount ownership; the default builder is explicitly configured as root |
+| `PGID` | `100` | API group ID for bind-mount ownership |
 
 ---
 
@@ -248,7 +293,7 @@ VNoctis Manager can publish built web games to [Cloudflare R2](https://developer
 
 ### Setup
 
-1. **Enable R2 mode** — add `VNM_R2_MODE=true` to your `.env` and restart the API container. On first start, `vnm.db` is copied to `vnm-r2.db`; the original database is never modified.
+1. **Enable R2 mode** — add `VNM_R2_MODE=true` to your `.env` and recreate the API container using your normal Compose files. On first start, `vnm.db` is copied to `vnm-r2.db`; the original database is never modified.
 
 2. **Create a Cloudflare R2 bucket** in the Cloudflare dashboard with public access enabled (set a custom domain or use the bucket's `r2.dev` subdomain).
 
@@ -304,14 +349,11 @@ Games display their R2 publish status across the UI:
 
 Open the game detail modal and click **Unpublish** — this deletes all game files from R2 under `{bucket}/{gameId}/` and regenerates the static gallery without the unpublished game.
 
-### Future Enhancements
+### Scope
 
-1. **Batch Publishing** — Publish multiple games at once
-2. **CDN Purge** — Invalidate Cloudflare cache after publish
-3. **Custom Gallery Themes** — Allow customizing gallery appearance
-4. **Publish Scheduling** — Schedule publishes for specific times
-5. **Access Control** — Password-protect the static gallery
-6. **Analytics** — Track game plays via Cloudflare Analytics
+R2 publishes a public static gallery and game assets. Cross-origin published
+games do not receive the manager's authenticated save synchronization or offline
+preparation features. Those features target same-origin games served by VNoctis.
 
 ---
 
@@ -327,18 +369,18 @@ You can import a Ren'Py game directly from the UI — either by uploading a loca
 2. Select the **Upload File** tab (default).
 3. **Drag and drop** an archive file (`.zip`, `.tar.bz2`, or `.rar`) onto the drop zone, or click to browse.
 4. Click **Upload & Import** — a progress bar tracks the upload in real time.
-5. The server extracts the archive into `/games/<folder>/` and triggers a library scan.
-6. The game appears in your library automatically.
+5. Wait for the upload-accepted acknowledgement (`202` with a job ID). The archive must finish uploading before you close the browser; uploads are not resumable.
+6. Extraction and registration continue in the background. Follow the job from **Jobs**; the game appears in the library after processing completes.
 
 ### Method 2: From URL
 
 1. Click the green **Import Game** button in the top navigation bar.
 2. Select the **From URL** tab.
 3. Paste a direct download URL to an archive file (e.g., `https://example.com/game.zip`).
-4. Click **Download & Import** — the server downloads the file with real-time progress streamed back to your browser.
-5. After download, the archive is extracted and scanned automatically.
+4. Click **Download & Import** — the API immediately accepts a background job and returns its ID.
+5. Follow download, extraction and registration from **Jobs**. Processing continues after closing the overlay or browser.
 
-> **Note:** The URL method downloads the file **server-side**, so it doesn't consume your local bandwidth twice. The server streams NDJSON progress events so you see download progress in real time. For URL imports, the archive format is auto-detected from the URL filename; URLs without a recognised extension default to `.zip`.
+> URL downloads happen server-side. Jobs show byte progress when the remote server supplies a size, plus the current stage and retained log. URL imports infer the archive format from the URL filename; unrecognised extensions default to `.zip`. Failed/cancelled processing can be retried from Jobs while its staged input remains available. See [background jobs](docs/background-jobs.md) for restart and cleanup behavior.
 
 ### Archive Structure Handling
 
@@ -353,7 +395,7 @@ The import handles two common archive layouts:
 
 ### Reverse Proxy Configuration
 
-If you use a **reverse proxy** in front of VNoctis Manager (e.g., **Nginx Proxy Manager**, Traefik, Caddy), you must increase the upload size limit to allow large game ZIPs (games can be 5–24 GB):
+If you use a **reverse proxy** in front of VNoctis Manager (e.g., **Nginx Proxy Manager**, Traefik, Caddy), you must increase the upload size limit to allow large game ZIPs (the default game-upload limit is 24 GiB):
 
 #### Nginx Proxy Manager
 
@@ -380,19 +422,29 @@ proxy_read_timeout 600;
 #### Traefik
 
 ```yaml
-# In the middleware or service configuration:
-maxRequestBodyBytes: 25769803776  # 24 GB
+# Dynamic configuration (file provider)
+http:
+  middlewares:
+    vnoctis-upload:
+      buffering:
+        maxRequestBodyBytes: 25769803776  # 24 GiB
 ```
+
+Attach that middleware to the VNoctis router using the appropriate provider
+reference. Traefik buffers requests before forwarding them, including to disk;
+allow enough proxy storage for large uploads. See the [buffering documentation](https://doc.traefik.io/traefik/reference/routing-configuration/http/middlewares/buffering/).
 
 #### Caddy
 
 ```caddyfile
 request_body {
-    max_size 24GB
+    max_size 25769803776 # 24 GiB
 }
 ```
 
-> **Note:** The VNoctis Manager containers already have the correct upload limits configured internally. Only your external reverse proxy needs adjustment.
+See Caddy's [`request_body` reference](https://caddyserver.com/docs/caddyfile/directives/request_body) for the versions and syntax supported by your installation.
+
+The bundled Nginx and API default to 24 GiB game uploads. Save-backup ZIPs have a separate 16 GiB limit. Proxy body limits and timeouts still apply during uploads; extraction/build time no longer needs one HTTP request to stay open.
 
 ---
 
@@ -412,7 +464,7 @@ If you have already built a game's web distribution on another machine (or don't
    └── MyVisualNovel-web.zip    ← drop the ZIP here
    ```
 3. **Trigger a scan** — the scanner runs automatically on container startup, or you can trigger one manually via `POST /api/v1/library/scan`.
-4. **Automatic extraction** — the scanner detects the ZIP, extracts it to `/web-builds/{gameId}/`, verifies that `index.html` exists in the output, and marks the game as built.
+4. **Automatic extraction** — the scanner detects the ZIP, extracts it to `/web-builds/<game-directory-name>/`, verifies that `index.html` exists in the output, and marks the game as built.
 5. **Play immediately** — the UI will show **▶ Play** instead of **▶ Build & Play**, and the game is ready to play in the browser.
 
 > **Tip:** This is useful for games that require specific Ren'Py SDK versions or custom build configurations that differ from the builder's environment.
@@ -446,41 +498,41 @@ When building a web distribution, the builder can compress images to reduce the 
 
 ### How It Works
 
-```
-Original game (/games/MyGame/)          Compressed overlay (/tmp/build-{jobId}/)
-├── game/                               ├── game/
-│   ├── script.rpy      ── symlink ──▶  │   ├── script.rpy → (original)
-│   ├── audio/           ── symlink ──▶  │   ├── audio/ → (original)
-│   ├── images/                          │   ├── images/
-│   │   ├── bg01.jpg     ── compress ─▶  │   │   ├── bg01.jpg (recompressed)
-│   │   ├── char.png     ── compress ─▶  │   │   ├── char.png (quantised)
-│   │   └── ui.webp      ── compress ─▶  │   │   └── ui.webp (re-encoded)
-│   └── video/           ── symlink ──▶  │   └── video/ → (original)
-└── renpy/               ── symlink ──▶  └── renpy/ → (original)
-```
+The builder runs SDK work in a temporary overlay. SDK-writable `.rpy`, `.rpyc`,
+`.rpym` and `.rpymc` scripts and progressive-download rules are copied locally;
+other unchanged assets can be symlinked. Packed assets are extracted into
+preparation storage when required. Original imported files are retained.
 
-1. **Before `web_build`**, the builder creates a temporary **symlink overlay** of the entire game directory
-2. All non-image files (scripts, audio, video, fonts) are **symlinked** — zero extra disk space
-3. Image files (`.jpg`, `.jpeg`, `.png`, `.webp`, `.bmp`) are **compressed into the overlay** using parallel worker processes
-4. Ren'Py's `web_build` runs from the overlay, packaging the compressed images into the web distribution
-5. The overlay is **deleted** after the build completes (success or failure)
+| Format | Tool | Processing |
+|---|---|---|
+| JPEG | `jpegoptim` | Lossy re-quantisation and metadata stripping |
+| PNG | `pngquant` | Palette quantisation with transparency support |
+| WebP | Pillow | Re-encoding at the configured quality and encoder method |
+| BMP | Pillow | Conversion to PNG |
 
-**Original game files are never modified.**
+Savings and build times depend on source images, hardware and settings. The
+quality values in the [compression configuration](#image-compression-web-builds)
+are passed to the builder; WebP encoder effort is a separate setting.
 
-### Compression Per Format
+### Rebuilds and asset reuse
 
-| Format | Tool | Typical Savings | Notes |
-|--------|------|-----------------|-------|
-| JPEG | `jpegoptim` | 20–50% | Lossy re-quantisation + metadata strip |
-| PNG | `pngquant` | 40–70% | Lossy palette quantisation, preserves transparency |
-| WebP | Pillow | 15–30% | Re-encode at target quality |
-| BMP | Pillow → PNG | 80–95% | BMP is uncompressed; conversion always wins |
+- With no reusable compression record, **Compress assets** is checked by default.
+  Uncheck it for an uncompressed build.
+- With reusable optimized images, the dialog shows their count and an unchecked
+  **Force recompress assets** option. Leave it unchecked to reuse unchanged
+  published images; new/changed images are optimized as needed.
+- Checking **Force recompress assets** starts from the original source images.
+  Changed settings/tool versions or missing/damaged output also require fresh
+  optimization. Older builds need one tracked optimization build to gain reuse.
 
-### Skipping Compression
+Reuse checks source/output hashes and settings, using the actual published files
+or `game.zip` members. There is no extra permanent cache containing a second full
+game. Temporary overlays are removed afterward. The log's “N% of original” is a running output/input size ratio. Its separate
+image-count percentage covers compression only, not overall build progress.
 
-Uncheck **"Compress assets"** in the build dialog to skip RPA extraction and image compression. The builder will log `Asset compression skipped (user opted out)` and proceed directly with the original game files.
-
-If compression is enabled but fails for any reason (disk space, corrupted image, etc.), the builder **automatically falls back** to building from the original uncompressed game files — the build is never blocked by a compression failure.
+Compression failures can fall back to an uncompressed overlay. A failed rebuild
+retains the previously validated playable output. See [build recovery and
+compression](docs/background-jobs.md) for details.
 
 ---
 
@@ -520,25 +572,88 @@ If a `progressive_download.txt` file already exists in the game's project root (
 [vnm-builder] progressive_download.txt already exists — keeping existing rules
 ```
 
-This applies to all build paths: compressed, uncompressed, and rebuilds. When using the compression overlay, the file is either symlinked from the original (if it existed) or written fresh to the overlay — original game files are never modified.
+This applies to all build paths: compressed, uncompressed, and rebuilds. The file is copied into the temporary build overlay (if it existed) or generated there — original game files are never modified.
+
+---
+
+## 💾 Saves, Backups and Offline Play
+
+### Save synchronization and history
+
+Same-origin games synchronize saves by authenticated account and stable game ID.
+Saves survive rebuilds and library removal; missing games' saves remain retained
+until explicitly deleted. Administrators manage those records from **Orphaned
+saves**. Deleting a user deletes that user's saves and history.
+
+Open **Save History** from either launcher to inspect retained versions, restore
+progress, delete non-current versions, import native save folders/files, or
+export/import a **VNoctis backup ZIP**. Keep backup ZIPs intact for reimport;
+VNoctis preserves save bytes; it does not translate saves between Ren'Py
+engine versions. Desktop compatibility depends on the game and engine versions. History is separate from Ren'Py's rotating
+save slots. Native folder import works before first play when a build has known
+save-directory metadata; otherwise run the game once for runtime detection.
+
+Startup waits for save preparation before releasing the engine. Supported builds
+load the newest slot and metadata first, then prefetch other slots; loading an
+uncached slot waits for that file. Pending offline progress and older builds can
+require fuller hydration. The current loading screen can remain at **Downloading
+game data… 100%** during this preparation; the toast's dismissal timer does not
+control the wait. Detailed sync/recovery limits are in [save synchronization](docs/save-sync.md).
+
+### Personal and administrator backups
+
+Open **Dashboard → Save backups** to export/import your account across games.
+Administrators can choose **All users** and review destination account/game
+mappings. Existing current progress is kept by default; explicit replacement
+preserves the previous version in history. Missing users are recreated as viewers
+and need passwords set by an administrator. Missing games retain saves and match
+later installations using the same game-directory identity; renamed games need
+explicit mapping.
+
+Backups include synced current saves, retained history and required signing data,
+with duplicate binary files stored once. They exclude unsynced browser-only
+progress, account passwords/roles, settings and game/build files. A save backup
+is therefore **not a full application backup**. Preserve deployment data and keys
+separately for full migration/rollback. Temporary backup tasks expire after 24
+hours; completed imports remain saved. The ZIP limit is 16 GiB and each snapshot
+is limited to 128 MiB. See [portable backups](docs/save-sync.md#portable-save-backups).
+
+### Cached downloads versus prepared offline games
+
+Normal launches reuse downloaded game assets where possible. That alone does not
+prepare the whole game for offline use. On **Dashboard**, choose **Prepare a game
+for offline play** to download and verify the app shell, game assets and your
+save checkpoint. Existing builds need rebuilding once to acquire an asset
+inventory and the supported save adapter. The dashboard reports readiness and
+supports checking, updating and removing downloads.
+
+Save data and offline readiness belong to the signed-in account; public game
+asset bytes can be reused across accounts. **Protect downloaded files** requests
+browser storage persistence, but the browser can deny it. Quotas, eviction,
+clearing site data, changed browser origins and rebuilds can affect readiness.
+Check the dashboard before disconnecting. Removing downloaded game assets does
+not erase saves or pending uploads. See [game download storage](docs/game-download-storage.md)
+and [offline readiness](docs/save-sync.md) for limitations.
 
 ---
 
 ## 📡 API Reference
 
-All endpoints are prefixed with `/api/v1` and proxied through Nginx.
+All endpoints are prefixed with `/api/v1` and proxied through Nginx. The tables
+summarize the primary routes; request schemas, save limits and recovery protocols
+are documented in the linked feature guides and route implementations.
 
 ### Authentication & Users
 
 | Method | Endpoint | Auth | Description |
 |---|---|---|---|
-| `POST` | `/auth/login` | — | Authenticate with username & password, returns JWT with `{ userId, username, role }` |
+| `POST` | `/auth/login` | — | Authenticate with username/password; returns `{ token }`, containing a JWT with user ID, username and role claims |
 | `POST` | `/auth/logout` | — | End session (client removes token) |
 | `GET` | `/auth/me` | any | Validate current session, returns `{ userId, username, role }` |
 | `GET` | `/users` | admin | List all users with favorite counts |
 | `POST` | `/users` | admin | Create a new user (`{ username, password, role? }`) |
 | `PATCH` | `/users/:userId` | admin | Update a user's role (`{ role }`) |
-| `DELETE` | `/users/:userId` | admin | Delete a user (cascades favorites); cannot delete self or last admin |
+| `DELETE` | `/users/:userId` | admin | Delete a user and their favorites/saves/history; cannot delete self or last admin |
 | `POST` | `/users/:userId/reset-password` | admin | Reset a user's password (`{ password }`) |
 
 ### Favorites
@@ -560,9 +675,9 @@ All endpoints are prefixed with `/api/v1` and proxied through Nginx.
 | `PATCH` | `/library/:gameId` | admin | Update game metadata (manual overrides); also accepts `hidden` (Boolean) to hide/unhide a game |
 | `POST` | `/library/:gameId/mark-playable` | admin | Manually mark a game as playable (verifies `index.html` exists in `/web-builds/<dir>/`) |
 | `POST` | `/library/unhide-all` | admin | Bulk unhide all hidden games; returns `{ unhiddenCount }` |
-| `DELETE` | `/library/:gameId` | admin | Fully delete a game — removes source directory, web-build output, covers, screenshots, build logs, build-job records, and the database entry |
-| `POST` | `/library/import` | admin | Upload a game archive — `.zip`, `.tar.bz2`, or `.rar` (multipart form, field: `file`) |
-| `POST` | `/library/import-url` | admin | Import from URL (JSON body: `{ "url": "..." }`, streams NDJSON progress; supports `.zip`, `.tar.bz2`, `.rar`) |
+| `DELETE` | `/library/:gameId` | admin | Delete game source, output, covers/screenshots and library entry; saves and durable job/log records remain independently managed |
+| `POST` | `/library/import` | admin | Upload `.zip`, `.tar.bz2` or `.rar` (multipart field `file`); returns `202` and `{ jobId, status }` after staging the complete upload |
+| `POST` | `/library/import-url` | admin | Accept a URL-import job (JSON `{ "url": "..." }`); returns `202` and `{ jobId, status }`, progress via Jobs |
 
 ### Metadata & Builds
 
@@ -570,12 +685,71 @@ All endpoints are prefixed with `/api/v1` and proxied through Nginx.
 |---|---|---|---|
 | `GET` | `/covers/:gameId` | — | Serve cached cover image for a game |
 | `GET` | `/metadata/vndb/search?q=` | admin | Search VNDB by title (min 3 chars) — returns `[{ id, title, alttitle, developer, released }]` for autocomplete |
+| `GET` | `/metadata/steam/search?q=` | admin | Search Steam metadata |
+| `GET` | `/library/:gameId/compression` | any | Inspect published compression/reuse metadata |
 | `POST` | `/metadata/:gameId/refresh` | admin | Re-fetch VNDB metadata (optional body: `{ "vndbId": "v12345" }` to force-link) |
-| `POST` | `/build/:gameId` | admin | Queue a WebAssembly build for a game (returns `202`) |
+| `POST` | `/build/:gameId` | admin | Accept a background build (`compressAssets`, `forceRecompress`); returns `202` and a job ID |
 | `GET` | `/build/:jobId` | any | Get build job status |
-| `GET` | `/build/:jobId/log` | — | SSE stream of build log lines |
+| `GET` | `/build/:jobId/log` | admin | Legacy authenticated SSE build-log stream; current UI uses `/jobs/:id/log` |
 | `DELETE` | `/build/:jobId` | admin | Cancel a queued or in-progress build |
 | `GET` | `/health` | — | Service health check (database, builder, library stats) |
+
+### Background Jobs (admin)
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/jobs` | Paginated retained import/build jobs; `active=1` filters active work |
+| `GET` | `/jobs/:id` | Durable status, stage, timestamps and errors |
+| `GET` | `/jobs/:id/log` | Cursor-based log reads (`offset`); `download=1` streams the full log |
+| `POST` | `/jobs/:id/cancel` | Cancel before final publication/registration |
+| `POST` | `/jobs/:id/retry` | Retry failed/cancelled work when required inputs remain available |
+| `DELETE` | `/jobs/:id` | Remove terminal job/log records and unneeded staging; keep the game/build |
+
+The viewer retains the latest 5,000 nonempty lines; full downloads contain the
+complete log. Closing a launcher does not delete logs. See [background jobs](docs/background-jobs.md).
+
+### Save Sync, History and Storage
+
+These routes require authentication and operate on the signed-in account, except
+for the explicitly public build identity and administrator orphan controls.
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET`, `PUT` | `/games/:gameId/saves` | Read current progress/manifest; upload revision-checked changes |
+| `POST` | `/games/:gameId/saves/directory` | Record the game's runtime save destination |
+| `GET` | `/games/:gameId/saves/files/:hash` | Read an owned current binary save/support file |
+| `GET` | `/games/:gameId/saves/files/:hash/preview` | Read a native save's metadata/thumbnail |
+| `GET` | `/games/:gameId/saves/versions/:versionId/files/:hash` | Read a file pinned to an owned historical version |
+| `GET` | `/games/:gameId/saves/history` | Paginated history and destination metadata |
+| `GET` | `/games/:gameId/saves/history/:versionId` | Read a historical snapshot as API data |
+| `POST` | `/games/:gameId/saves/history/import` | Import selected native files with revision checks |
+| `POST` | `/games/:gameId/saves/history/:versionId/restore` | Restore a version while preserving previous progress |
+| `DELETE` | `/games/:gameId/saves/history/:versionId` | Delete a non-current version |
+| `GET` | `/games/:gameId/cache-build` | Public build identity only; no private saves |
+| `GET` | `/games/:gameId/offline-manifest` | Authenticated build inventory for offline preparation |
+| `GET` | `/games/:gameId/offline-file` | Authenticated original asset, pinned to inventory/build |
+| `GET` | `/admin/orphaned-saves` | Admin: list saves for games outside the library |
+| `GET`, `DELETE` | `/admin/orphaned-saves/:userId/:gameId` | Admin: export or explicitly remove orphaned saves/history |
+
+See [save sync](docs/save-sync.md) and [asset storage](docs/game-download-storage.md).
+
+### Portable Save Backups
+
+Task routes belong to the authenticated owner. Exporting/restoring all users
+also requires the current administrator role.
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `POST` | `/save-backups/exports` | Prepare a snapshot, personal or all-user backup ZIP |
+| `POST` | `/save-backups/imports` | Stage one ZIP (multipart field `backup`), then verify it in the background |
+| `GET` | `/save-backups/jobs` | List the current account's retained backup tasks |
+| `GET` | `/save-backups/jobs/:id` | Read progress, review readiness or results |
+| `GET` | `/save-backups/jobs/:id/contents` | Read source identities and available destinations |
+| `POST` | `/save-backups/jobs/:id/preview` | Review account/game mappings without importing |
+| `POST` | `/save-backups/jobs/:id/apply` | Apply the reviewed plan in the background |
+| `POST` | `/save-backups/jobs/:id/download` | Obtain a short-lived, one-use native-download URL |
+| `GET` | `/save-backups/download/:ticket` | Stream that prepared ZIP using its capability, without a JWT in the URL |
+| `DELETE` | `/save-backups/jobs/:id` | Remove terminal/review task staging, keeping imported saves |
 
 ### R2 Settings *(R2 mode only — requires `VNM_R2_MODE=true`)*
 
@@ -591,7 +765,7 @@ All endpoints are prefixed with `/api/v1` and proxied through Nginx.
 |---|---|---|---|
 | `POST` | `/publish/:gameId` | admin | Start a publish job — uploads web build files to R2 and regenerates the static gallery; returns `202` with `{ jobId }` |
 | `GET` | `/publish/:jobId` | admin | Get publish job status (DB record merged with live in-memory progress) |
-| `GET` | `/publish/:jobId/progress` | — | SSE stream of publish progress events (`progress`, `snapshot`, `done`, `error`); unauthenticated (UUID-based security) |
+| `GET` | `/publish/:jobId/progress` | — | SSE stream of publish progress events (`progress`, `snapshot`, `done`, `error`); public progress stream keyed by job ID |
 | `DELETE` | `/publish/:gameId` | admin | Unpublish a game — deletes all R2 files under `{bucket}/{gameId}/` and regenerates the static gallery |
 | `POST` | `/publish/gallery` | admin | Manually regenerate the static gallery on R2 without republishing any games |
 
@@ -601,21 +775,24 @@ All endpoints are prefixed with `/api/v1` and proxied through Nginx.
 |---|---|---|---|
 | `POST` | `/internal/client-error` | — | Report a client-side error for persistent logging (JSON body: `{ message, stack?, componentStack?, url?, userAgent? }`; rate-limited to 100/min) |
 | `POST` | `/internal/build/:jobId/status` | — | Builder callback — update build job status (`building`, `done`, `failed`) |
-| `POST` | `/internal/build/:jobId/log` | — | Builder callback — append a log line to the in-memory buffer for SSE subscribers |
+| `POST` | `/internal/build/:jobId/log` | — | Builder callback — append a line to the retained job log |
 
-> **Authentication:** All endpoints except `/health`, `/auth/*`, `/internal/*`, `/covers/*`, `/build/:jobId/log` (SSE), and `/publish/:jobId/progress` (SSE) require a valid `Authorization: Bearer <token>` header. Obtain a token via `POST /auth/login`. Endpoints marked **admin** return `403 Forbidden` for viewer-role users.
+> **Authentication:** Use `Authorization: Bearer <token>` from `POST /auth/login`. Jobs and build-log endpoints require admin access. Public exceptions include health, login/logout, cover images, build identity and the legacy publish-progress stream. Internal callbacks follow their service routes. `/auth/me` validates a token despite the global auth-prefix exemption. Save-backup downloads validate a short-lived, one-use capability. A game ID or job ID does not replace authentication on private routes.
 
 ---
 
 ## 🛠️ Development
 
-To run services locally without Docker for active development:
+Use the Docker stack for full player, Nginx and offline integration checks. To
+run individual services natively, configure their environment explicitly, including
+`VNM_ADMIN_PASSWORD` and isolated data paths; Compose normally supplies these
+values. The commands below do not load the root `.env` automatically:
 
 ### vnm-api
 
 ```bash
 cd services/vnm-api
-npm install
+npm ci
 npx prisma generate
 npm run dev
 ```
@@ -624,7 +801,7 @@ npm run dev
 
 ```bash
 cd services/vnm-ui
-npm install
+npm ci
 npm run dev
 ```
 
@@ -633,130 +810,77 @@ npm run dev
 ```bash
 cd services/vnm-builder
 pip install -r requirements.txt
-python src/main.py
+cd src
+python main.py
 ```
 
 > **Note:** The Vite dev server is configured with a proxy in [`vite.config.js`](services/vnm-ui/vite.config.js) that forwards `/api` requests to `http://vnm-api:3001`. For local development, update the proxy target to `http://localhost:3001`.
 
 ---
 
+### Validation and development scope
+
+Use Node.js 24 and the locked dependencies. API tests need a generated Prisma
+client; builder process-group/overlay checks require Linux. Browser integration
+checks need Playwright's browser installed (or the supported installed-Chrome
+option).
+
+```bash
+# From services/vnm-ui
+npm test
+npm run test:save-worker
+npm run test:player
+
+# From services/vnm-api (Prisma client generated)
+npm test
+python3 -m unittest discover -s test -p test_archives.py -v
+
+# From services/vnm-builder, with requirements installed on Linux
+python -m unittest discover -s tests -v
+python -m unittest discover -s test -v
+```
+
+Native API startup uses container paths such as `/data` and `/games`; use an
+isolated development environment rather than pointing tests at live deployment
+data. For the main-based branch workflow, release preparation and server migration,
+see [fork development](docs/fork-development.md).
+
+---
+
 ## 📁 Project Structure
 
-```
-├── compose.yml                # Docker Compose (pre-built images)
-├── compose_local_build.yml    # Docker Compose (build from source)
-├── .env.example               # Environment variable template
+```text
+├── .github/workflows/         # Container image publication
+├── compose.yml               # Published-image stack; bind-mounted data
+├── compose.build.yml         # Thin local source-build overlay; same data mounts
+├── compose_local_build.yml   # Legacy standalone named-volume stack
+├── .env.example              # Compose settings template
+├── docs/                     # Fork migration, saves, storage and background jobs
 ├── services/
-│   ├── vnm-api/               # Node.js backend
-│   │   ├── Dockerfile
-│   │   ├── docker-entrypoint.sh
-│   │   ├── package.json
-│   │   ├── prisma/            # Database schema & migrations
-│   │   │   ├── schema.prisma
-│   │   │   └── migrations/
-│   │   └── src/
-│   │       ├── index.js
-│   │       ├── routes/        # REST API endpoints
-│   │       │   ├── auth.js
-│   │       │   ├── build.js
-│   │       │   ├── covers.js
-│   │       │   ├── favorites.js   # Per-user favorites endpoints
-│   │       │   ├── health.js
-│   │       │   ├── import.js
-│   │       │   ├── internal.js
-│   │       │   ├── library.js
-│   │       │   ├── metadata.js
-│   │       │   ├── publish.js     # R2 publish/unpublish + SSE progress (R2 mode)
-│   │       │   ├── settings.js    # R2 credential management (R2 mode)
-│   │       │   └── users.js       # User management CRUD (admin only)
-│   │       ├── services/      # Business logic
-│   │       │   ├── buildOrchestrator.js
-│   │       │   ├── coverDownloader.js
-│   │       │   ├── encryption.js      # AES-256-GCM encrypt/decrypt for R2 secrets
-│   │       │   ├── enrichment.js
-│   │       │   ├── galleryGenerator.js # Static gallery HTML/JSON builder (R2 mode)
-│   │       │   ├── matcher.js
-│   │       │   ├── r2Client.js        # AWS SDK v3 Cloudflare R2 client (R2 mode)
-│   │       │   ├── rpaExtractor.js
-│   │       │   ├── scanner.js
-│   │       │   ├── screenshotDownloader.js
-│   │       │   ├── synopsisCleaner.js
-│   │       │   ├── titleExtractor.js
-│   │       │   ├── vndbClient.js
-│   │       │   └── watcher.js
-│   │       └── templates/
-│   │           └── gallery.html   # Self-contained static gallery template (R2 mode)
-│   ├── vnm-builder/           # Python build worker
-│   │   ├── Dockerfile
-│   │   ├── docker-entrypoint.sh
-│   │   ├── requirements.txt
-│   │   └── src/
-│   │       ├── main.py
-│   │       ├── builder.py
-│   │       ├── build_queue.py
-│   │       ├── compressor.py
-│   │       └── logger.py
-│   └── vnm-ui/               # React frontend
-│       ├── Dockerfile
-│       ├── nginx.conf
-│       ├── package.json
-│       ├── vite.config.js
-│       ├── index.html
-│       └── src/
-│           ├── App.jsx
-│           ├── main.jsx
-│           ├── index.css
-│           ├── components/    # UI components
-│           │   ├── BuildProgress.jsx
-│           │   ├── CreateUserModal.jsx     # Create user form modal (admin)
-│           │   ├── ErrorBoundary.jsx
-│           │   ├── GameCard.jsx
-│           │   ├── GameDetailModal.jsx
-│           │   ├── ImportGameModal.jsx
-│           │   ├── MetadataEditModal.jsx
-│           │   ├── Navbar.jsx
-│           │   ├── Pagination.jsx
-│           │   ├── PlayerChrome.jsx
-│           │   ├── PublishProgressModal.jsx # R2 publish SSE progress modal (R2 mode)
-│           │   ├── ResetPasswordModal.jsx  # Password reset modal (admin)
-│           │   ├── SaveWarningToast.jsx
-│           │   ├── ScreenshotLightbox.jsx
-│           │   ├── SearchAndFilter.jsx
-│           │   ├── SkeletonCard.jsx
-│           │   ├── SortBar.jsx
-│           │   └── StarBackground.jsx
-│           ├── components/gallery/  # Gallery-specific UI
-│           │   ├── GalleryCard.jsx
-│           │   ├── GalleryDetailModal.jsx
-│           │   ├── GalleryHero.jsx
-│           │   ├── GalleryNavbar.jsx
-│           │   └── GalleryRow.jsx
-│           ├── hooks/         # Custom React hooks
-│           │   ├── useApi.js
-│           │   ├── useAuth.jsx
-│           │   ├── useBuildLog.js
-│           │   ├── useBuildStatus.js
-│           │   ├── useFilterSort.js
-│           │   ├── useGallery.js
-│           │   ├── useLibrary.js
-│           │   ├── usePublish.js      # R2 publish/unpublish actions (R2 mode)
-│           │   ├── useSettings.js     # R2 credential form state (R2 mode)
-│           │   ├── useTheme.js
-│           │   └── useUsers.js    # User management data hook (admin)
-│           ├── lib/
-│           │   └── utils.js
-│           └── pages/
-│               ├── BuildLog.jsx
-│               ├── Gallery.jsx
-│               ├── Library.jsx
-│               ├── Login.jsx
-│               ├── Player.jsx
-│               ├── R2Settings.jsx     # R2 credential settings page (admin, R2 mode)
-│               └── UserManagement.jsx  # Admin user management page
-├── extras/
-│   └── screenshots/           # README screenshot images
-└── README_Security.md         # Security audit report
+│   ├── vnm-api/
+│   │   ├── prisma/           # Shared schema and database migrations
+│   │   ├── src/routes/       # Library, Jobs, saves, backups, users, metadata, R2
+│   │   ├── src/services/     # Durable jobs, archives, save storage and publishing
+│   │   ├── templates/        # Static R2 gallery
+│   │   └── test/             # API, migration, archive and storage checks
+│   ├── vnm-builder/
+│   │   ├── src/              # SDK builds, overlays, compression, save adapters
+│   │   ├── tests/            # Compatibility, jobs, CPU limits and asset reuse
+│   │   └── test/             # Save metadata/adapter and offline inventory checks
+│   └── vnm-ui/
+│       ├── public/           # Save bridge/workers and app/game offline workers
+│       ├── src/components/   # Launchers, history/backups and shared controls
+│       ├── src/hooks/        # Authentication, library and durable log access
+│       ├── src/pages/        # Library, Dashboard, Player, Jobs, BuildLog, Users
+│       ├── src/utils/        # Cache verification, offline state and save helpers
+│       └── test/             # Unit and built-browser integration checks
+├── tools/cache-test/         # Isolated asset-cache acceptance tools
+├── extras/screenshots/       # Original interface screenshots
+└── README_Security.md        # Historical security audit
 ```
+
+The locally ignored `test-data/` contains development fixtures/tracking in the
+maintainer checkout. It is not supplied by a clone and is not backed up by Git.
 
 ---
 
@@ -779,17 +903,22 @@ python src/main.py
 |---|---|
 | **"No games found"** | Check `VNM_ROOT` in `.env`. Ensure each game directory inside `${VNM_ROOT}/games/` contains a `game/` subdirectory with `.rpy` files or a `renpy/` directory at the game root. |
 | **"VNDB not matching"** | Try lowering `VNDB_MATCH_THRESHOLD` (e.g. `0.5`). You can also manually link a game via its VNDB ID in the detail modal, or use `POST /api/v1/metadata/:gameId/refresh` with `{ "vndbId": "v12345" }`. |
-| **"Build failed"** | Verify the Ren'Py SDK version is 8.x+ and `${VNM_ROOT}/renpy-sdk` is accessible. Check build logs via the SSE stream in the UI, or run `docker compose logs vnm-builder`. |
+| **"Build failed"** | Verify the configured Ren'Py SDK (default 8.5.2) is installed and `${VNM_ROOT}/renpy-sdk` is writable by the builder. Open **Jobs → View log** for the retained full build log, or run `docker compose logs vnm-builder`. |
 | **"Container unhealthy"** | Inspect logs with `docker compose logs <service>` for errors. Ensure volumes are correctly mounted and ports are not in use. |
 | **Pre-built ZIP not detected** | Ensure the `.zip` is placed directly inside the game directory (alongside the `game/` folder). Trigger a manual rescan via the UI or API endpoint. |
 | **"App won't start — missing VNM_ADMIN_PASSWORD"** | Set `VNM_ADMIN_PASSWORD` in your `.env` file. This variable is required and has no default value. |
 | **"Session expired / logged out unexpectedly"** | Increase `VNM_SESSION_TTL_DAYS` in `.env` (default is 30 days). Clearing browser data also removes the session. |
-| **"Forgot admin password"** | Set `RESET_ADMIN_PASSWORD=true` and the desired `VNM_ADMIN_PASSWORD` in `.env`, then restart the API container (`docker compose restart vnm-api`). The admin account's password will be updated from the environment variable on next startup. Remove `RESET_ADMIN_PASSWORD` (or set to `false`) afterwards. |
+| **"Forgot admin password"** | Use the temporary API environment override described under [Authentication](#authentication); set the desired password, recreate the API with the override, then recreate without it. The base file does not forward `RESET_ADMIN_PASSWORD` from `.env`. |
 | **Finding error logs** | Persistent logs are at `${VNM_ROOT}/data/logs/vnm-api.log` and `${VNM_ROOT}/data/logs/vnm-builder.log` (structured JSON, one object per line). You can also use `docker compose logs vnm-api` / `docker compose logs vnm-builder` for recent stdout output. Client-side (browser) errors are forwarded to the API log via the `ErrorBoundary` component. |
-| **R2 Settings button not visible** | The R2 button in the navbar only appears when `VNM_R2_MODE=true` and the user is an admin. Verify the env var is set in `.env` and the container was restarted (`docker compose restart vnm-api`). |
-| **"R2 mode is not enabled" error in settings modal** | The modal shows this error when the `/settings/r2` endpoint returns `404`, which means the API started without `VNM_R2_MODE=true`. Check the env var and restart the API container. |
+| **R2 Settings button not visible** | The R2 button in the navbar only appears when `VNM_R2_MODE=true` and the user is an admin. Verify the env var is set in `.env` and the API was recreated with the updated environment using your normal Compose files. |
+| **"R2 mode is not enabled" error in settings modal** | The modal shows this error when the `/settings/r2` endpoint returns `404`, which means the API started without `VNM_R2_MODE=true`. Check the container environment and recreate the API using the updated Compose configuration. |
 | **R2 connection test fails** | Verify: (1) account ID matches the Cloudflare dashboard, (2) API token has _Object Read & Write_ permissions on the correct bucket, (3) bucket name is spelled correctly, (4) public URL starts with `https://`. |
 | **Publish job stuck or failing** | Check `docker compose logs vnm-api` for upload errors. Common causes: R2 credentials not saved, bucket not found, or network timeout. Re-saving credentials and retrying usually resolves transient errors. |
+| **Game download is at 100% but startup waits** | The engine also waits for save initialization. The current asset progress display does not show that phase; the save toast's timeout does not release the game. |
+| **Game downloads repeat / offline preparation unavailable** | Use HTTPS or localhost, check Dashboard storage/readiness, and verify the browser supports service workers and has free storage. A rebuild changes cache identity. |
+| **Save backup ZIP does not load in a desktop game** | It is a VNoctis reimport package, not a desktop save conversion. Use **Import backup ZIP** in Save History or Dashboard; native compatibility depends on engine versions. |
+| **Logs disappear when closing a launcher** | Open **Jobs → View log** or `/build-log/<jobId>`. The durable log remains until its job record is explicitly removed. |
+| **Published fork image cannot be pulled** | Verify the fork's Docker Images workflow completed and the GHCR package is public, or authenticate with package access. Use the source-build overlay until publication is ready. |
 | **Static gallery not updating** | Use **Admin → R2 Settings → Regenerate Gallery** (or `POST /api/v1/publish/gallery`) to force a gallery rebuild. This uploads a fresh `index.html` and `gallery.json` without re-uploading any game files. |
 
 ---
@@ -809,9 +938,9 @@ The launcher's "Install Live2D" buttons are simple zip extraction scripts that p
 
 1. **Download** the [Cubism SDK for Native](https://www.live2d.com/sdk/download/native/) and [Cubism SDK for Web](https://www.live2d.com/sdk/download/web/) zip files.
 
-2. **Place both zips** into your Ren'Py SDK directory (the same path you set as `RENPY_SDK_PATH`).
+2. **Place both zips** in the host SDK directory, `${VNM_ROOT}/renpy-sdk` for the default stack. It is mounted at `/renpy-sdk` inside the builder. Match the SDK versions expected by your Ren'Py release; see the [Ren'Py Live2D documentation](https://www.renpy.org/doc/html/live2d.html) and [installer source](https://github.com/renpy/renpy/blob/master/launcher/game/install.rpy).
 
-3. **Extract the required files** using these commands:
+3. **Extract the required files** using these commands inside the builder's shell (`docker compose exec vnm-builder sh`, using your normal Compose overrides). Alternatively, replace `/renpy-sdk` with its host path and run them on the host:
 
 ```bash
 # --- Native SDK (libLive2DCubismCore.so for Linux) ---
@@ -848,7 +977,7 @@ unzip -l /renpy-sdk/CubismSdkForWeb-*.zip | grep -i "live2dcubismcore.js"
 
 ### After extraction
 
-No additional configuration is needed. The `web_build` command automatically detects `lib/web/live2dcubismcore.js` and bundles it into the output. Games that use `Live2D()` or Live2D wrapper classes will work without code changes.
+Rebuild the affected game after installing the libraries and verify its animations in the target browser. Supplying the libraries does not guarantee compatibility for custom Live2D wrappers or games built against a different engine/SDK version.
 
 > **Tip:** If you rebuild your Docker containers frequently, consider adding these extraction commands to a setup script or placing the pre-extracted files directly in your mounted `RENPY_SDK_PATH` on the host so they persist across container recreations.
 
@@ -856,18 +985,19 @@ No additional configuration is needed. The `web_build` command automatically det
 
 ## 📄 License
 
-This project is licensed under the [MIT License](LICENSE).
+The upstream README identifies VNoctis as MIT licensed, but this checkout currently has no `LICENSE` file. Recovering the license text from a verified upstream source is tracked in [fork development](docs/fork-development.md#overhaul-roadmap). Original attribution is retained.
 
 ---
 
 ## 🔒 Security
 
-A detailed security audit is maintained in [`README_Security.md`](README_Security.md). It covers authentication design, session management, input validation, Docker configuration, and API security — including a findings scorecard against common vulnerabilities.
+The [security audit](README_Security.md) is dated March 19, 2026 and predates the fork's Jobs, save sync, backups and offline work. Its findings are useful historical context, not a current audit of those additions or of your deployment.
 
 ---
 
 ## 🙏 Acknowledgments
 
+- [starrlord/VNoctis](https://github.com/starrlord/VNoctis) — Original VNoctis Manager project
 - [Ren'Py](https://www.renpy.org/) — Visual novel engine
 - [VNDB](https://vndb.org/) — Visual novel database API
 - Built with ❤️ for the visual novel community
