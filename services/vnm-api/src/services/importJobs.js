@@ -1,8 +1,9 @@
-import { createWriteStream } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { createReadStream, createWriteStream } from 'node:fs';
 import { mkdir, rm, stat, statfs, rename, rmdir } from 'node:fs/promises';
 import { join, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { Readable, Transform } from 'node:stream';
+import { Readable, Transform, addAbortSignal } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -59,6 +60,19 @@ export function registerImportJobs(app, gamesPath, maxBytes) {
       await context.progress({ bytesDone: BigInt(bytesDone), bytesTotal: BigInt(bytesTotal || bytesDone) });
     }
     if (!archive || !(await stat(archive)).size) throw new Error('Archive is empty.');
+    if (input.expectedHash) {
+      await context.progress({ stage: 'verifying', bytesDone: 0n, bytesTotal: BigInt((await stat(archive)).size) });
+      await context.log('[verifying] Checking the assembled archive against the browser SHA-256 checksum.');
+      const hash = createHash('sha256');
+      let received = 0, lastReport = 0;
+      for await (const chunk of addAbortSignal(context.signal, createReadStream(archive))) {
+        hash.update(chunk); received += chunk.length;
+        if (Date.now() - lastReport >= 1000) { lastReport = Date.now(); await context.progress({ bytesDone: BigInt(received) }); }
+      }
+      if (hash.digest('hex') !== input.expectedHash) throw new Error('Archive checksum mismatch. Nothing was extracted. Upload the original archive again.');
+      await context.progress({ bytesDone: BigInt(received) });
+      await context.log('[verifying] Archive checksum matches.');
+    }
     // Extraction and publication must share a filesystem for an atomic rename.
     const unpack = join(gamesPath, '.vnm-staging', job.id);
     await rm(unpack, { recursive: true, force: true });

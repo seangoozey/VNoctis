@@ -2,6 +2,7 @@ import { mkdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { appendJobLog } from './jobLogs.js';
+import { getImportUploads } from './importUploads.js';
 import { buildFailureStatus } from './buildJobs.js';
 
 export const terminalJob = status => ['done', 'failed', 'cancelled'].includes(status);
@@ -74,7 +75,7 @@ export function createJobRunner(app, { storage, logs, interval = 1000, reconcile
         const handler = handlers.get(job.kind);
         if (!handler) break;
         const claimed = await app.prisma.workJob.updateMany({ where: { id: job.id, status: 'queued' },
-          data: { status: 'running', startedAt: new Date() } });
+          data: { status: 'running', startedAt: job.startedAt || new Date() } });
         if (!claimed.count) continue;
         const controller = new AbortController(); controllers.set(job.id, controller);
         try {
@@ -126,6 +127,7 @@ export function createJobRunner(app, { storage, logs, interval = 1000, reconcile
     async cancel(id) {
       const job = await app.prisma.workJob.findUnique({ where: { id } });
       if (!job || terminalJob(job.status)) return false;
+      if (job.status === 'uploading') return getImportUploads(app).cancel(id, job.ownerId);
       const cancelled = await app.prisma.workJob.updateMany({ where: { id, status: { in: ['queued', 'running'] }, stage: { notIn: ['publishing', 'scanning'] } },
         data: { status: 'cancelled', stage: 'cancelled', completedAt: new Date() } });
       if (!cancelled.count) return false;

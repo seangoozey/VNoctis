@@ -87,6 +87,12 @@ function AppContent() {
   const { theme, toggleTheme, isDark } = useTheme();
   const { user, logout, isAuthenticated, isAdmin, isOffline } = useAuth();
   const [showImportModal, setShowImportModal] = useState(false);
+  const [resumeImportId, setResumeImportId] = useState(null);
+  useEffect(() => {
+    const resume = event => { if (isAdmin) { setResumeImportId(event.detail.uploadId); setShowImportModal(true); } };
+    window.addEventListener('vnm:resume-import', resume);
+    return () => window.removeEventListener('vnm:resume-import', resume);
+  }, [isAdmin]);
   const [showR2Modal, setShowR2Modal] = useState(false);
   const [showOrphanedSaves, setShowOrphanedSaves] = useState(false);
   const [r2Mode, setR2Mode] = useState(false);
@@ -208,7 +214,8 @@ function AppContent() {
       {!isLoginPage && (
         <ImportGameModal
           open={showImportModal}
-          onClose={() => setShowImportModal(false)}
+          resumeUploadId={resumeImportId}
+          onClose={() => { setShowImportModal(false); setResumeImportId(null); }}
           onImported={() => {
             window.dispatchEvent(new Event('vnm:library-refresh'));
           }}

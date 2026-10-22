@@ -227,6 +227,8 @@ model WorkJob {
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
+  upload      ImportUpload?
+
   @@index([status, createdAt])
 }
 
@@ -265,4 +267,18 @@ model GamePatch {
   createdAt DateTime @default(now())
   game Game @relation(fields: [gameId], references: [id], onDelete: Cascade)
   @@index([gameId, position])
+}
+
+model ImportUpload {
+  id String @id
+  ownerId String
+  name String
+  size BigInt
+  offset BigInt @default(0)
+  checksum String
+  lastError String?
+  expiresAt DateTime
+  updatedAt DateTime @updatedAt
+  job WorkJob @relation(fields: [id], references: [id], onDelete: Cascade)
+  @@index([ownerId, expiresAt])
 }

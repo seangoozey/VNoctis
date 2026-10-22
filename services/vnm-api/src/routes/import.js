@@ -1,6 +1,8 @@
 import { createWriteStream } from 'node:fs';
 import { mkdir, rm, stat, open } from 'node:fs/promises';
 import { join, basename } from 'node:path';
+import { Transform } from 'node:stream';
+import { getImportUploads, IMPORT_CHUNK_BYTES } from '../services/importUploads.js';
 import { randomUUID } from 'node:crypto';
 import { pipeline } from 'node:stream/promises';
 import { archiveType, registerImportJobs } from '../services/importJobs.js';
@@ -9,6 +11,37 @@ export default async function importRoutes(app) {
   const games = process.env.GAMES_PATH || '/games';
   const maxBytes = (Number(process.env.MAX_IMPORT_SIZE_MB) || 24576) * 1024 * 1024;
   registerImportJobs(app, games, maxBytes);
+  const uploads = getImportUploads(app);
+  app.addHook('preHandler', async (request, reply) => {
+    if (request.user?.role !== 'admin') return reply.code(request.user ? 403 : 401).send({ message: 'Admin access required.' });
+  });
+  app.addContentTypeParser('application/octet-stream', { parseAs: 'buffer', bodyLimit: IMPORT_CHUNK_BYTES }, (request, body, done) => done(null, body));
+  app.addHook('onError', async (request, reply, error) => {
+    if (request.params?.id && request.user?.userId && request.url.includes('/import-uploads/')) await uploads.recordFailure(request.params.id, request.user.userId, error, request.id);
+  });
+  const cleanupTimer = setInterval(() => uploads.cleanup().catch(error => app.log.warn({ error: error.message }, 'Upload cleanup failed')), 5 * 60 * 1000);
+  cleanupTimer.unref();
+  app.addHook('onClose', async () => { clearInterval(cleanupTimer); await uploads.stop(); });
+  app.get('/library/import-uploads/limits', async () => uploads.limits());
+  app.get('/library/import-uploads', async request => uploads.list(request.user.userId));
+  app.post('/library/import-uploads', async (request, reply) => {
+    const result = await uploads.create(request.user.userId, request.body);
+    reply.header('X-Upload-Id', result.uploadId);
+    return reply.code(201).send(result);
+  });
+  app.get('/library/import-uploads/:id', async (request, reply) => {
+    reply.header('Cache-Control', 'no-store');
+    return uploads.get(request.params.id, request.user.userId);
+  });
+  app.put('/library/import-uploads/:id/chunk', { bodyLimit: IMPORT_CHUNK_BYTES }, async (request, reply) => {
+    reply.header('X-Upload-Id', request.params.id);
+    return uploads.chunk(request.params.id, request.user.userId, Number(request.query.offset), request.body, request.headers['x-chunk-sha256'], request.id);
+  });
+  app.post('/library/import-uploads/:id/complete', async (request, reply) => reply.code(202).send(await uploads.complete(request.params.id, request.user.userId)));
+  app.delete('/library/import-uploads/:id', async (request, reply) => {
+    if (!await uploads.cancel(request.params.id, request.user.userId)) return reply.code(409).send({ message: 'Upload already handed to the importer. Use Jobs to cancel processing.' });
+    return { cancelled: true };
+  });
   app.post('/library/import', { bodyLimit: maxBytes }, async (request, reply) => {
     const data = await request.file({ limits: { fileSize: maxBytes } });
     if (!data) return reply.code(400).send({ message: 'Select a game archive.' });
@@ -18,7 +51,14 @@ export default async function importRoutes(app) {
     let accepted = false;
     try {
       await mkdir(directory, { recursive: true });
-      await pipeline(data.file, createWriteStream(archive));
+      let received = 0, lastReport = 0;
+      const progress = new Transform({ transform(chunk, encoding, callback) {
+        received += chunk.length;
+        if (Date.now() - lastReport > 10000) { lastReport = Date.now(); request.log.info({ uploadId: id, receivedBytes: received }, 'Legacy import receiving bytes'); }
+        callback(null, chunk);
+      } });
+      request.log.info({ uploadId: id, maxBytes }, 'Legacy import upload started');
+      await pipeline(data.file, progress, createWriteStream(archive));
       if (data.file.truncated) throw Object.assign(new Error('Upload exceeds the import size limit.'), { statusCode: 413 });
       if (!(await stat(archive)).size) throw Object.assign(new Error('The uploaded archive is empty.'), { statusCode: 400 });
       const uploaded = await open(archive, 'r+');

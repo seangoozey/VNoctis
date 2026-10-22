@@ -1,11 +1,13 @@
 import { useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import api from '../hooks/useApi';
+import useAuth from '../hooks/useAuth';
 import { stageLabels } from '../utils/jobLog';
 
 let jobsCache = null;
 
 export default function Jobs() {
+  const { user } = useAuth();
   const [data, setData] = useState(() => jobsCache?.token === localStorage.getItem('vnm-token') ? jobsCache.data : { items: [] });
   const [offset, setOffset] = useState(0);
   const [activeOnly, setActiveOnly] = useState(false);
@@ -36,30 +38,32 @@ export default function Jobs() {
     if (type === 'remove' && !window.confirm(`Remove the job record, log and staged upload for ${job.title}? The game and its playable build stay in the library.`)) return;
     setBusy(job.id); setError('');
     try {
-      const result = type === 'remove' ? await api.delete(`/jobs/${job.id}`) : await api.post(`/jobs/${job.id}/${type}`);
-      if (type === 'retry') navigate(`/build-log/${result.jobId}`);
+      const result = type === 'finish-upload' ? await api.post(`/library/import-uploads/${job.id}/complete`) : type === 'remove' ? await api.delete(`/jobs/${job.id}`) : await api.post(`/jobs/${job.id}/${type}`);
+      if (type === 'retry' || type === 'finish-upload') navigate(`/build-log/${result.jobId}`);
       else setData(await api.get(`/jobs?offset=${offset}&active=${activeOnly ? 1 : 0}`));
     } catch (error) { setError(error.message); }
     finally { setBusy(null); }
   }
   return <section className="max-w-6xl mx-auto p-4 sm:p-6">
     <h1 className="text-2xl font-bold mb-2">Jobs</h1>
-    <p className="text-gray-500 dark:text-gray-400 mb-6">Imports and builds continue here after you close their windows. Open a log to follow progress.</p>
+    <p className="text-gray-500 dark:text-gray-400 mb-6">Imports and builds continue on the server after upload acceptance. Unfinished browser uploads can be resumed by reselecting the archive in Import Game.</p>
     <div className="flex gap-2 mb-4">{[false, true].map(value => <button key={String(value)} aria-pressed={activeOnly === value} onClick={() => { setActiveOnly(value); setOffset(0); }} className={`px-4 py-2 rounded-lg ${activeOnly === value ? 'bg-blue-600 text-white' : 'bg-gray-200 dark:bg-gray-700'}`}>{value ? 'In progress' : 'All jobs'}</button>)}</div>
     {error && <p role="alert" className="text-red-400 mb-4">{error}</p>}
     {!data.items.length && <p className="text-gray-500">No jobs yet.</p>}
     <div className="space-y-3">{data.items.map(job => {
-      const running = ['queued', 'running'].includes(job.status);
+      const running = ['queued', 'running', 'uploading'].includes(job.status);
       return <article key={job.id} className="rounded-xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 p-4 flex flex-col sm:flex-row gap-4 sm:items-center">
         <div className="flex-1 min-w-0">
           <h2 className="font-semibold break-words">{job.title}</h2>
           <p className="text-sm text-gray-500 dark:text-gray-400">{job.kind === 'build' ? 'Build' : 'Import'} · {stageLabels[job.stage] || job.stage} · {new Date(job.createdAt).toLocaleString()}</p>
           {job.startedAt && running && <p className="text-xs text-gray-500 mt-1">Elapsed: {Math.max(0, Math.floor((Date.now() - new Date(job.startedAt)) / 1000))} seconds</p>}
-          {job.bytesDone > 0 && <p className="text-sm mt-1">{(job.bytesDone / 1048576).toFixed(1)} MB{job.bytesTotal > 0 ? ` of ${(job.bytesTotal / 1048576).toFixed(1)} MB` : ''}</p>}
+          {job.status === 'uploading' && <p className="text-xs text-gray-500 mt-1">Confirmed bytes are retained for 24 hours after progress. Resume from a browser with the original archive.</p>}
+          {job.bytesTotal > 0 && <p className="text-sm mt-1">{(job.bytesDone / 1048576).toFixed(1)} MB{job.bytesTotal > 0 ? ` of ${(job.bytesTotal / 1048576).toFixed(1)} MB` : ''}</p>}
           {job.error && <p className="text-sm text-red-400 mt-2 break-words">{job.error}</p>}
         </div>
         <div className="flex flex-wrap gap-2">
           <Link to={`/build-log/${job.id}`} className="px-4 py-2 min-h-11 rounded-lg bg-blue-600 hover:bg-blue-500 text-white">View log</Link>
+          {job.status === 'uploading' && job.bytesTotal > 0 && job.bytesDone === job.bytesTotal && user?.userId === job.ownerId ? <button disabled={busy === job.id} onClick={() => action(job, 'finish-upload')} className="px-4 py-2 min-h-11 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white">Finish upload</button> : job.status === 'uploading' && user?.userId === job.ownerId && <button onClick={() => window.dispatchEvent(new CustomEvent('vnm:resume-import', { detail: { uploadId: job.id } }))} className="px-4 py-2 min-h-11 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white">Resume upload</button>}
           {running && !['publishing', 'scanning'].includes(job.stage) && <button disabled={busy === job.id} onClick={() => action(job, 'cancel')} className="px-4 py-2 min-h-11 rounded-lg bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600">Cancel</button>}
           {['failed', 'cancelled'].includes(job.status) && <button disabled={busy === job.id} onClick={() => action(job, 'retry')} className="px-4 py-2 min-h-11 rounded-lg bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600">Retry</button>}
           {!running && <button disabled={busy === job.id} onClick={() => action(job, 'remove')} className="px-4 py-2 min-h-11 rounded-lg text-red-600 dark:text-red-400 hover:bg-red-100 dark:hover:bg-red-950">Remove job</button>}

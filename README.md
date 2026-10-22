@@ -55,7 +55,7 @@ These screenshots show the original interface. Dashboard, Jobs and save backup c
 - **Background Imports and Builds** — Accepted imports and builds continue after closing the launcher. An admin Jobs page provides persisted progress, cancellation, retries and retained logs with reconnecting delivery and full downloads. See [background jobs](docs/background-jobs.md) for recovery and deployment details.
 - **Image Compression** — Automatic lossy recompression of JPEG, PNG, and WebP images during web builds using a symlink overlay — original game files are never modified, unchanged optimized images can be reused on rebuilds; size savings depend on the game
 - **Pre-built ZIP Import** — Drop a pre-built web distribution `.zip` into a game directory and the scanner auto-detects, extracts, and marks it as built — no rebuild needed; a **"Mark as Playable"** fallback button lets you bypass the build system entirely for manually extracted web builds
-- **Game Import via UI** — Upload a `.zip`, `.tar.bz2`, or `.rar` game archive or paste a remote URL — with real-time progress bars, drag-and-drop, and automatic extraction into the games directory
+- **Game Import via UI** — Upload a `.zip`, `.tar.bz2`, or `.rar` game archive or paste a remote URL — with resumable file uploads, confirmed-byte progress, drag-and-drop, and automatic extraction into the games directory
 - **Save Sync and History** — Per-user/per-game progress, offline recovery, retained save versions and restore controls; see [save synchronization](docs/save-sync.md).
 - **Save Backups** — Reimportable VNoctis snapshot ZIPs, personal bulk backups and reviewed administrator migrations across users, including games not yet installed.
 - **Game Caching and Offline Preparation** — Reuse downloaded game assets and manage per-account offline preparation from the dashboard; see [download storage](docs/game-download-storage.md).
@@ -368,9 +368,15 @@ You can import a Ren'Py game directly from the UI — either by uploading a loca
 1. Click the green **Import Game** button in the top navigation bar.
 2. Select the **Upload File** tab (default).
 3. **Drag and drop** an archive file (`.zip`, `.tar.bz2`, or `.rar`) onto the drop zone, or click to browse.
-4. Click **Upload & Import** — a progress bar tracks the upload in real time.
-5. Wait for the upload-accepted acknowledgement (`202` with a job ID). The archive must finish uploading before you close the browser; uploads are not resumable.
-6. Extraction and registration continue in the background. Follow the job from **Jobs**; the game appears in the library after processing completes.
+4. Click **Upload & Import**. VNoctis checks the archive locally in a worker, creates a job, and uploads bounded chunks. Progress distinguishes bytes sent from bytes confirmed by the server.
+5. Keep the browser open to transfer the file, or **Pause & close**. To resume, reopen **Import Game** (or **Jobs → Resume upload**) and reselect the same archive. Confirmed chunks survive browser reloads and API restarts and are retained for 24 hours after the last confirmed progress.
+6. Once the complete upload is accepted, checksum verification, extraction and registration continue in the background. Follow the job from **Jobs**; the game appears in the library after processing completes.
+
+Unfinished uploads belong to the administrator who started them. Automatic retries
+are bounded, and failures include an upload ID and downloadable diagnostics without
+authentication tokens. If all bytes arrived but final acceptance was interrupted,
+**Jobs → Finish upload** queues processing without selecting the file again.
+See [resumable imports](docs/resumable-imports.md) for recovery and deployment details.
 
 ### Method 2: From URL
 
@@ -395,7 +401,7 @@ The import handles two common archive layouts:
 
 ### Reverse Proxy Configuration
 
-If you use a **reverse proxy** in front of VNoctis Manager (e.g., **Nginx Proxy Manager**, Traefik, Caddy), you must increase the upload size limit to allow large game ZIPs (the default game-upload limit is 24 GiB):
+If you use a **reverse proxy** in front of VNoctis Manager (e.g., **Nginx Proxy Manager**, Traefik, Caddy), configure its limits for the operations you use. The browser importer sends at most 16 MiB per request and can reduce chunks after HTTP 413 responses; the default total game-archive limit remains 24 GiB. Legacy multipart uploads and save-backup imports still need their larger request limits:
 
 #### Nginx Proxy Manager
 
@@ -444,7 +450,7 @@ request_body {
 
 See Caddy's [`request_body` reference](https://caddyserver.com/docs/caddyfile/directives/request_body) for the versions and syntax supported by your installation.
 
-The bundled Nginx and API default to 24 GiB game uploads. Save-backup ZIPs have a separate 16 GiB limit. Proxy body limits and timeouts still apply during uploads; extraction/build time no longer needs one HTTP request to stay open.
+The bundled Nginx permits 24 GiB requests for legacy game uploads. New browser imports use chunks of at most 16 MiB, reducing after HTTP 413 responses down to 256 KiB. Save-backup ZIPs have a separate 16 GiB limit. Proxy body limits and idle timeouts still apply to each request; extraction/build time does not need one HTTP request to stay open.
 
 ---
 
@@ -707,6 +713,11 @@ are documented in the linked feature guides and route implementations.
 | `POST` | `/library/unhide-all` | admin | Bulk unhide all hidden games; returns `{ unhiddenCount }` |
 | `DELETE` | `/library/:gameId` | admin | Delete game source, output, covers/screenshots and library entry; saves and durable job/log records remain independently managed |
 | `POST` | `/library/import` | admin | Upload `.zip`, `.tar.bz2` or `.rar` (multipart field `file`); returns `202` and `{ jobId, status }` after staging the complete upload |
+| `GET` | `/library/import-uploads/limits` | admin | Total archive limit, chunk size and retention |
+| `GET`, `POST` | `/library/import-uploads` | admin | List own unfinished uploads; create an idempotent upload/job with `{ uploadId, name, size, checksum }` |
+| `GET`, `DELETE` | `/library/import-uploads/:id` | owning admin | Read confirmed offset or discard an unfinished upload |
+| `PUT` | `/library/import-uploads/:id/chunk?offset=N` | owning admin | Raw chunk with `X-Chunk-SHA256`; acknowledge durable confirmed offset |
+| `POST` | `/library/import-uploads/:id/complete` | owning admin | Idempotently queue a complete archive for checksum verification and import |
 | `POST` | `/library/import-url` | admin | Accept a URL-import job (JSON `{ "url": "..." }`); returns `202` and `{ jobId, status }`, progress via Jobs |
 
 ### Metadata & Builds

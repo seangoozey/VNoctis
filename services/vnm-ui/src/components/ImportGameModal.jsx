@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom';
 import api from '../hooks/useApi';
 import ImportDialog from './ImportDialog';
 import ImportFileDropzone from './ImportFileDropzone';
+import { uploadGameArchive } from '../utils/resumableImport';
 import { stageLabels } from '../utils/jobLog';
 
 /**
@@ -29,11 +30,11 @@ function formatFileSize(bytes) {
  *   onImported: () => void,
  * }} props
  */
-export default function ImportGameModal({ open, onClose, onImported }) {
+export default function ImportGameModal({ open, onClose, onImported, resumeUploadId = null }) {
   const [tab, setTab] = useState('file'); // 'file' | 'url'
   const [file, setFile] = useState(null);
   const [url, setUrl] = useState('');
-  const [phase, setPhase] = useState('idle'); // idle | uploading | downloading | extracting | success | error
+  const [phase, setPhase] = useState('idle'); // idle | uploading | paused | downloading | extracting | success | error
   const [progress, setProgress] = useState(0);
   const [downloadedBytes, setDownloadedBytes] = useState(0);
   const [totalBytes, setTotalBytes] = useState(0);
@@ -41,7 +42,19 @@ export default function ImportGameModal({ open, onClose, onImported }) {
   const [resultFolder, setResultFolder] = useState('');
   const [jobId, setJobId] = useState(null);
   const [jobStage, setJobStage] = useState('queued');
-  const xhrRef = useRef(null);
+  const [uploadId, setUploadId] = useState(null);
+  const [uploadMetrics, setUploadMetrics] = useState(null);
+  const [diagnostics, setDiagnostics] = useState([]);
+  const [pendingUploads, setPendingUploads] = useState([]);
+  const [resumeTarget, setResumeTarget] = useState(null);
+  const [selectedResumeId, setSelectedResumeId] = useState(null);
+  const [pendingBusy, setPendingBusy] = useState(null);
+  const [maxUploadBytes, setMaxUploadBytes] = useState(null);
+  const [clock, setClock] = useState(Date.now());
+  const uploadAbortRef = useRef(null);
+  const generationRef = useRef(0);
+  const openRef = useRef(open);
+  openRef.current = open;
   const abortRef = useRef(null);
   const fileInputRef = useRef(null);
   const importedRef = useRef(onImported);
@@ -60,9 +73,39 @@ export default function ImportGameModal({ open, onClose, onImported }) {
       setResultFolder('');
       setTab('file');
       setJobId(null);
-      setJobStage('queued');
+      setJobStage('queued'); setUploadId(null); setUploadMetrics(null); setDiagnostics([]); setResumeTarget(null); setSelectedResumeId(resumeUploadId); setPendingUploads([]);
     }
   }, [open]);
+
+  useEffect(() => {
+    if (!open) { uploadAbortRef.current?.abort(); return; }
+    let active = true;
+    api.get('/library/import-uploads').then(items => { if (active) setPendingUploads(items); }).catch(() => {});
+    api.get('/library/import-uploads/limits').then(limits => { if (active) setMaxUploadBytes(limits.maxBytes); }).catch(() => {});
+    if (resumeUploadId) api.get(`/library/import-uploads/${resumeUploadId}`).then(upload => {
+      if (active) { setResumeTarget(upload); setTab('file'); }
+    }).catch(error => { if (active) { setSelectedResumeId(null); setErrorMsg(error.message); } });
+    return () => { active = false; };
+  }, [open, resumeUploadId]);
+  useEffect(() => () => { generationRef.current++; uploadAbortRef.current?.abort(); abortRef.current?.abort(); }, []);
+  useEffect(() => {
+    if (phase !== 'uploading') return;
+    const timer = setInterval(() => setClock(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [phase]);
+  const closeImport = useCallback(() => { generationRef.current++; uploadAbortRef.current?.abort(); onClose(); }, [onClose]);
+  const downloadDiagnostics = () => {
+    const blob = new Blob([JSON.stringify({ file: file ? { name: file.name, size: file.size, lastModified: file.lastModified } : null,
+      uploadId: uploadId || resumeTarget?.uploadId, jobId, error: errorMsg, metrics: uploadMetrics, events: diagnostics }, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob), anchor = document.createElement('a');
+    anchor.href = url; anchor.download = 'vnoctis-import-diagnostics.json'; anchor.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+  const discardPending = async upload => {
+    setPendingBusy(upload.uploadId); setErrorMsg('');
+    try { await api.delete(`/library/import-uploads/${upload.uploadId}`); setPendingUploads(items => items.filter(item => item.uploadId !== upload.uploadId)); if (resumeTarget?.uploadId === upload.uploadId) { setResumeTarget(null); setSelectedResumeId(null); } }
+    catch (error) { setErrorMsg(error.message); }
+    finally { setPendingBusy(null); }
+  };
 
   const isProcessing = phase === 'uploading' || phase === 'downloading' || phase === 'extracting';
   const isSuccess = phase === 'success';
@@ -117,79 +160,30 @@ export default function ImportGameModal({ open, onClose, onImported }) {
     if (fileInputRef.current) fileInputRef.current.value = '';
   }, []);
 
-  // ── File Upload handler ────────────────────────────
-  const handleFileUpload = useCallback(() => {
+  // Uploads remain resumable when this window/tab closes; only extraction is server-driven.
+  const handleFileUpload = useCallback(async () => {
     if (!file || isProcessing) return;
-
-    setPhase('uploading');
-    setProgress(0);
-    setErrorMsg('');
-
-    const xhr = new XMLHttpRequest();
-    xhrRef.current = xhr;
-
-    xhr.upload.addEventListener('progress', (e) => {
-      if (e.lengthComputable) {
-        const pct = Math.round((e.loaded / e.total) * 100);
-        setProgress(pct);
-        if (pct >= 100) {
-          setPhase('extracting');
-        }
-      }
-    });
-
-    xhr.upload.addEventListener('load', () => {
-      setPhase('extracting');
-      setProgress(100);
-    });
-
-    xhr.addEventListener('load', () => {
-      xhrRef.current = null;
-
-      if (xhr.status >= 200 && xhr.status < 300) {
-        try {
-          const response = JSON.parse(xhr.responseText);
-          if (!response.jobId) throw new Error('Missing import job');
-          setJobId(response.jobId); setPhase('extracting');
-        } catch {
-          setPhase('error'); setErrorMsg('Could not read the import result. Check Jobs before uploading again.');
-        }
-      } else {
-        let message = `Upload failed (HTTP ${xhr.status})`;
-        try {
-          const response = JSON.parse(xhr.responseText);
-          if (response.message) message = response.message;
-        } catch {
-          if (xhr.statusText) message = `${xhr.status} ${xhr.statusText}`;
-        }
-        setPhase('error');
-        setErrorMsg(message);
-      }
-    });
-
-    xhr.addEventListener('error', () => {
-      xhrRef.current = null;
-      setPhase('error');
-      setErrorMsg('Network error — check your connection and try again.');
-    });
-
-    xhr.addEventListener('abort', () => {
-      xhrRef.current = null;
-      setPhase('idle');
-      setProgress(0);
-    });
-
-    const formData = new FormData();
-    formData.append('file', file);
-
-    xhr.open('POST', '/api/v1/library/import');
-    // Attach auth token for protected endpoint
-    const token = localStorage.getItem('vnm-token');
-    if (token) {
-      xhr.setRequestHeader('Authorization', `Bearer ${token}`);
-    }
-    xhr.send(formData);
-  }, [file, isProcessing, onImported]);
+    const generation = ++generationRef.current;
+    const controller = new AbortController(); uploadAbortRef.current = controller;
+    setPhase('uploading'); setProgress(0); setErrorMsg(''); setUploadMetrics(null); setClock(Date.now());
+    try {
+      const result = await uploadGameArchive(file, { signal: controller.signal, resumeId: selectedResumeId,
+        onProgress: metrics => {
+          if (generation !== generationRef.current || !openRef.current) return;
+          setUploadMetrics(previous => ({ ...previous, ...metrics }));
+          if (metrics.uploadId) setUploadId(metrics.uploadId);
+          setProgress(Number((Math.min(file.size, metrics.stage === 'checking' ? metrics.checkedBytes || 0 : metrics.sentBytes || 0) / file.size * 100).toFixed(1)));
+        },
+        onDiagnostic: entry => { if (generation === generationRef.current) setDiagnostics(events => [...events.slice(-29), entry]); },
+      });
+      if (generation !== generationRef.current || !openRef.current) return;
+      setJobId(result.jobId); setJobStage(result.stage || 'verifying'); setPhase('extracting');
+    } catch (error) {
+      if (generation !== generationRef.current || !openRef.current) return;
+      if (controller.signal.aborted) { setPhase('paused'); setErrorMsg('Upload paused. Confirmed bytes are retained for 24 hours after the last successful chunk.'); }
+      else { setPhase(error.uploadId ? 'paused' : 'error'); setErrorMsg(error.message); if (error.uploadId) setUploadId(error.uploadId); }
+    } finally { if (uploadAbortRef.current === controller) uploadAbortRef.current = null; }
+  }, [file, isProcessing, selectedResumeId]);
 
   // ── URL Download handler ───────────────────────────
   const handleUrlDownload = useCallback(async () => {
@@ -248,32 +242,31 @@ export default function ImportGameModal({ open, onClose, onImported }) {
     }
   }, [url, isProcessing, onImported]);
 
-  // ── Cancel handler ─────────────────────────────────
   const handleCancel = useCallback(async () => {
+    if (phase === 'uploading') { uploadAbortRef.current?.abort(); return; }
     if (jobId) {
       try { await api.post('/jobs/' + jobId + '/cancel'); setJobId(null); setPhase('idle'); }
       catch (error) { setErrorMsg(error.message); }
       return;
     }
-    xhrRef.current?.abort(); abortRef.current?.abort();
-    setPhase('idle'); setProgress(0);
-  }, [jobId]);
-
-  // ── Retry handler ──────────────────────────────────
-  const handleRetry = useCallback(() => {
-    setPhase('idle');
-    setProgress(0);
-    setErrorMsg('');
-  }, []);
+    abortRef.current?.abort(); setPhase('idle'); setProgress(0);
+  }, [jobId, phase]);
+  const handleRetry = useCallback(async () => {
+    if (jobId) {
+      try { const result = await api.post(`/jobs/${jobId}/retry`); setJobId(result.jobId); setPhase('extracting'); setErrorMsg(''); }
+      catch (error) { setErrorMsg(error.message); }
+    } else if (file && tab === 'file') handleFileUpload();
+    else { setPhase('idle'); setProgress(0); setErrorMsg(''); }
+  }, [jobId, file, tab, handleFileUpload]);
 
   if (!open) return null;
 
   // Determine which upload action to trigger
   const handleUploadAction = tab === 'file' ? handleFileUpload : handleUrlDownload;
-  const canSubmit = tab === 'file' ? !!file : !!url.trim();
+  const canSubmit = tab === 'file' ? !!file && (!selectedResumeId || !!resumeTarget) : !!url.trim();
 
   return (
-    <ImportDialog title="Import Game" subtitle="Upload an archive or import from URL" onClose={onClose} busy={isProcessing && !jobId}>
+    <ImportDialog title="Import Game" subtitle="Upload an archive or import from URL" onClose={closeImport} busy={isProcessing && !jobId && phase !== 'uploading'}>
         {/* Tab switcher — only visible in idle state */}
         {isIdle && (
           <div className="flex border-b border-gray-200 dark:border-gray-800 mx-6">
@@ -313,8 +306,11 @@ export default function ImportGameModal({ open, onClose, onImported }) {
         {/* Body */}
         <div className="px-6 py-5">
           {/* ── Idle: File Tab — file picker ── */}
+          {isIdle && tab === 'file' && resumeTarget && <div className="mb-4 rounded-lg border border-emerald-200 dark:border-emerald-800 bg-emerald-50 dark:bg-emerald-950/30 p-3 text-sm text-gray-700 dark:text-gray-300"><p className="font-medium break-all">Resume {resumeTarget.name}</p><p className="mt-1">{formatFileSize(resumeTarget.offset)} of {formatFileSize(resumeTarget.size)} confirmed. Reselect the same archive; its checksum will be checked before resuming.</p><button className="mt-2 underline text-emerald-700 dark:text-emerald-400" onClick={() => { setResumeTarget(null); setSelectedResumeId(null); }}>Choose a different upload</button></div>}
+          {isIdle && tab === 'file' && pendingUploads.length > 0 && <details className="mb-4 rounded-lg border border-gray-200 dark:border-gray-700 p-3 text-sm"><summary className="cursor-pointer font-medium text-gray-700 dark:text-gray-300">Unfinished uploads ({pendingUploads.length})</summary><ul className="mt-3 space-y-3">{pendingUploads.map(upload => <li key={upload.uploadId} className="space-y-2"><p className="break-all text-gray-700 dark:text-gray-300">{upload.name}</p><p className="text-xs text-gray-500 dark:text-gray-400">{formatFileSize(upload.offset)} of {formatFileSize(upload.size)} confirmed</p><div className="flex gap-3"><button disabled={Boolean(pendingBusy)} onClick={() => { setResumeTarget(upload); setSelectedResumeId(upload.uploadId); setFile(null); setErrorMsg(''); }} className="text-emerald-700 dark:text-emerald-400 underline">Resume</button><button disabled={Boolean(pendingBusy)} onClick={() => discardPending(upload)} className="text-red-600 dark:text-red-400">Discard upload</button></div></li>)}</ul></details>}
+
           {isIdle && tab === 'file' && !file && (
-            <ImportFileDropzone accept=".zip,.tar.bz2,.rar" hint="Supports .zip, .tar.bz2, and .rar — up to 24 GB" onSelect={handleFileSelect} inputRef={fileInputRef} />
+            <ImportFileDropzone accept=".zip,.tar.bz2,.rar" hint={`Resumable .zip, .tar.bz2 and .rar uploads${maxUploadBytes ? ' — up to ' + formatFileSize(maxUploadBytes) : ''}`} onSelect={handleFileSelect} inputRef={fileInputRef} />
           )}
 
           {/* ── Idle: File Tab — file selected ── */}
@@ -364,25 +360,22 @@ export default function ImportGameModal({ open, onClose, onImported }) {
             </div>
           )}
 
-          {/* ── Uploading (file) ── */}
-          {phase === 'uploading' && (
-            <div className="space-y-4">
-              <div className="flex items-center gap-3 p-4 bg-gray-50 dark:bg-gray-800/50 rounded-xl border border-gray-200 dark:border-gray-700">
-                <div className="w-10 h-10 rounded-lg bg-blue-500/10 dark:bg-blue-500/20 flex items-center justify-center flex-shrink-0">
-                  <svg className="w-5 h-5 text-blue-600 dark:text-blue-400 animate-pulse" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 0 0 5.25 21h13.5A2.25 2.25 0 0 0 21 18.75V16.5m-13.5-9L12 3m0 0 4.5 4.5M12 3v13.5" />
-                  </svg>
-                </div>
-                <div className="flex-1 min-w-0">
-                  <p className="text-sm font-medium text-gray-900 dark:text-white truncate">{file?.name}</p>
-                  <p className="text-xs text-gray-500 dark:text-gray-400">
-                    Uploading… {progress}% of {formatFileSize(file?.size || 0)}
-                  </p>
-                </div>
-              </div>
-              <ProgressBar progress={progress} color="blue" label="Uploading" />
+          {(phase === 'uploading' || phase === 'paused') && <div className="space-y-4">
+            <div className="p-4 bg-gray-50 dark:bg-gray-800/50 rounded-xl border border-gray-200 dark:border-gray-700 space-y-2">
+              <p className="font-medium text-gray-900 dark:text-white break-all">{file?.name || resumeTarget?.name}</p>
+              <p role="status" className="text-sm text-gray-700 dark:text-gray-300">{phase === 'paused' ? 'Upload paused' : ({ checking: 'Checking archive locally…', connecting: 'Connecting to upload service…', 'preparing-chunk': 'Preparing next chunk…', uploading: 'Uploading archive…', 'confirming-chunk': 'Waiting for server acknowledgement…', retrying: 'Connection interrupted — retrying…', confirming: 'Confirming completed upload…', accepted: 'Upload accepted' }[uploadMetrics?.stage] || 'Preparing upload…')}</p>
+              {uploadMetrics?.stage === 'checking' ? <p className="text-xs text-gray-500 dark:text-gray-400">{formatFileSize(uploadMetrics.checkedBytes || 0)} of {formatFileSize(file?.size || 0)} checked. This runs locally in a worker before transfer.</p> : <>
+                <p className="text-xs text-gray-500 dark:text-gray-400">Sent: {formatFileSize(uploadMetrics?.sentBytes || 0)} of {formatFileSize(file?.size || resumeTarget?.size || 0)}</p>
+                <p className="text-xs text-gray-500 dark:text-gray-400">Server confirmed: {formatFileSize(uploadMetrics?.confirmedBytes || 0)} · {formatFileSize(uploadMetrics?.bytesPerSecond || 0)}/s · Elapsed {Math.floor((uploadMetrics?.elapsedMs || 0) / 1000)}s</p>
+                {uploadMetrics?.lastNetworkProgressAt && phase === 'uploading' && <p className="text-xs text-gray-500 dark:text-gray-400">Last transfer progress {Math.max(0, Math.floor((clock - uploadMetrics.lastNetworkProgressAt) / 1000))}s ago</p>}
+              </>}
+              {uploadMetrics?.stage === 'retrying' && <p className="text-xs text-amber-700 dark:text-amber-300">{uploadMetrics.message}</p>}
+              {uploadId && <p className="text-xs text-gray-500 dark:text-gray-400 break-all">Upload ID: {uploadId}</p>}
             </div>
-          )}
+            <ProgressBar progress={progress} color="blue" label={uploadMetrics?.stage === 'checking' ? 'Checking archive' : 'Upload progress'} />
+            <p className="text-xs text-gray-500 dark:text-gray-400">Keep this tab open while uploading. Pause or close to retain confirmed bytes, then reselect this archive to resume. Verification and extraction continue on the server after acceptance.</p>
+            {errorMsg && <p role="alert" className="text-sm text-red-600 dark:text-red-400">{errorMsg}</p>}
+          </div>}
 
           {/* ── Downloading (URL) ── */}
           {phase === 'downloading' && (
@@ -433,7 +426,7 @@ export default function ImportGameModal({ open, onClose, onImported }) {
                   </p>
                 </div>
               </div>
-              <ProgressBar progress={-1} color="amber" label="Extracting" />
+              <ProgressBar progress={-1} color="amber" label={stageLabels[jobStage] || "Processing import"} />
             </div>
           )}
 
@@ -477,9 +470,9 @@ export default function ImportGameModal({ open, onClose, onImported }) {
         </div>
 
         {/* Footer / Action Buttons */}
-        <div className="flex items-center justify-end gap-3 px-6 py-4 border-t border-gray-200 dark:border-gray-800">
-          {jobId && <Link to={`/build-log/${jobId}`} onClick={onClose} className="text-sm text-emerald-600 dark:text-emerald-400">View log</Link>}
-          {jobId && isProcessing && <button onClick={onClose} className="px-3 py-2 text-sm text-gray-700 dark:text-gray-300">Continue in background</button>}
+        <div className="flex flex-wrap items-center justify-end gap-3 px-6 py-4 border-t border-gray-200 dark:border-gray-800">
+          {(jobId || uploadId) && <Link to={`/build-log/${jobId || uploadId}`} onClick={closeImport} className="text-sm text-emerald-600 dark:text-emerald-400">{phase === 'uploading' ? 'Pause & view log' : 'View log'}</Link>}
+          {jobId && isProcessing && <button onClick={closeImport} className="px-3 py-2 text-sm text-gray-700 dark:text-gray-300">Continue in background</button>}
           {isIdle && (
             <>
               <button
@@ -512,12 +505,15 @@ export default function ImportGameModal({ open, onClose, onImported }) {
             </>
           )}
 
+          {phase === 'uploading' && <button onClick={closeImport} className="px-3 py-2 text-sm text-gray-700 dark:text-gray-300">Pause & close</button>}
+          {phase === 'paused' && <><button onClick={() => { setPhase('idle'); setFile(null); setErrorMsg(''); }} className="px-3 py-2 text-sm text-gray-700 dark:text-gray-300">Choose file</button><button onClick={handleFileUpload} disabled={!file} className="px-5 py-2 text-sm font-semibold text-white bg-emerald-600 hover:bg-emerald-500 rounded-lg">Resume upload</button></>}
+          {(phase === 'paused' || isError || diagnostics.length > 0) && <button onClick={downloadDiagnostics} className="px-3 py-2 text-sm text-gray-700 dark:text-gray-300">Download diagnostics</button>}
           {isProcessing && (
             <button
               onClick={handleCancel}
               className="px-4 py-2 text-sm font-medium text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/10 rounded-lg transition-colors"
             >
-              Cancel
+              {phase === 'uploading' ? 'Pause' : 'Cancel'}
             </button>
           )}
 
