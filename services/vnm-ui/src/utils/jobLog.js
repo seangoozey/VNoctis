@@ -6,6 +6,7 @@ export function appendLogChunk(text, pending = '', done = false) {
 }
 
 export const stageLabels = {
+  uploading: 'Uploading / waiting for browser', verifying: 'Verifying archive checksum',
   queued: 'Queued', preparing: 'Preparing game files', 'builder-queued': 'Waiting for build worker',
   downloading: 'Downloading archive', inspecting: 'Inspecting archive', extracting: 'Extracting archive',
   'unpacking-rpa': 'Unpacking game assets', optimizing: 'Optimizing images', packaging: 'Building web distribution',

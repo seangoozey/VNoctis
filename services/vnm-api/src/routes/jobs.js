@@ -19,7 +19,7 @@ export default async function jobsRoutes(app) {
   }
   app.get('/jobs', options, async request => {
     const offset = Math.max(0, Math.min(100000, Number.parseInt(request.query.offset, 10) || 0));
-    const jobs = await app.prisma.workJob.findMany({ where: request.query.active === '1' ? { status: { in: ['queued', 'running'] } } : {},
+    const jobs = await app.prisma.workJob.findMany({ where: request.query.active === '1' ? { status: { in: ['queued', 'running', 'uploading'] } } : {},
       orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], skip: offset, take: 51 });
     return { items: jobs.slice(0, 50).map(publicJob), nextOffset: jobs.length > 50 ? offset + 50 : null };
   });
@@ -55,6 +55,7 @@ export default async function jobsRoutes(app) {
     const source = await app.prisma.workJob.findUnique({ where: { id: request.params.id } });
     if (!source || !['failed', 'cancelled'].includes(source.status)) return reply.code(409).send({ message: 'Only a failed or cancelled job can be retried.' });
     const input = JSON.parse(source.input);
+    if (input.uploadPending) return reply.code(409).send({ message: 'This archive was not fully uploaded. Open Import Game and reselect the original file to resume, or start a new upload if it expired or was cancelled.' });
     if (source.kind === 'build') {
       const result = await app.inject({ method: 'POST', url: `/api/v1/build/${source.gameId}`, headers: { authorization: request.headers.authorization }, payload: input });
       return reply.code(result.statusCode).send(result.json());
