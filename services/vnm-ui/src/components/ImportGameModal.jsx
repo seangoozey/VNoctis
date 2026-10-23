@@ -172,7 +172,7 @@ export default function ImportGameModal({ open, onClose, onImported, resumeUploa
           if (generation !== generationRef.current || !openRef.current) return;
           setUploadMetrics(previous => ({ ...previous, ...metrics }));
           if (metrics.uploadId) setUploadId(metrics.uploadId);
-          setProgress(Number((Math.min(file.size, metrics.stage === 'checking' ? metrics.checkedBytes || 0 : metrics.sentBytes || 0) / file.size * 100).toFixed(1)));
+          setProgress(Number((Math.min(file.size, metrics.sentBytes || 0) / file.size * 100).toFixed(1)));
         },
         onDiagnostic: entry => { if (generation === generationRef.current) setDiagnostics(events => [...events.slice(-29), entry]); },
       });
@@ -306,7 +306,7 @@ export default function ImportGameModal({ open, onClose, onImported, resumeUploa
         {/* Body */}
         <div className="px-6 py-5">
           {/* ── Idle: File Tab — file picker ── */}
-          {isIdle && tab === 'file' && resumeTarget && <div className="mb-4 rounded-lg border border-emerald-200 dark:border-emerald-800 bg-emerald-50 dark:bg-emerald-950/30 p-3 text-sm text-gray-700 dark:text-gray-300"><p className="font-medium break-all">Resume {resumeTarget.name}</p><p className="mt-1">{formatFileSize(resumeTarget.offset)} of {formatFileSize(resumeTarget.size)} confirmed. Reselect the same archive; its checksum will be checked before resuming.</p><button className="mt-2 underline text-emerald-700 dark:text-emerald-400" onClick={() => { setResumeTarget(null); setSelectedResumeId(null); }}>Choose a different upload</button></div>}
+          {isIdle && tab === 'file' && resumeTarget && <div className="mb-4 rounded-lg border border-emerald-200 dark:border-emerald-800 bg-emerald-50 dark:bg-emerald-950/30 p-3 text-sm text-gray-700 dark:text-gray-300"><p className="font-medium break-all">Resume {resumeTarget.name}</p><p className="mt-1">{formatFileSize(resumeTarget.offset)} of {formatFileSize(resumeTarget.size)} confirmed. Reselect the same archive name and size to continue.</p><button className="mt-2 underline text-emerald-700 dark:text-emerald-400" onClick={() => { setResumeTarget(null); setSelectedResumeId(null); }}>Choose a different upload</button></div>}
           {isIdle && tab === 'file' && pendingUploads.length > 0 && <details className="mb-4 rounded-lg border border-gray-200 dark:border-gray-700 p-3 text-sm"><summary className="cursor-pointer font-medium text-gray-700 dark:text-gray-300">Unfinished uploads ({pendingUploads.length})</summary><ul className="mt-3 space-y-3">{pendingUploads.map(upload => <li key={upload.uploadId} className="space-y-2"><p className="break-all text-gray-700 dark:text-gray-300">{upload.name}</p><p className="text-xs text-gray-500 dark:text-gray-400">{formatFileSize(upload.offset)} of {formatFileSize(upload.size)} confirmed</p><div className="flex gap-3"><button disabled={Boolean(pendingBusy)} onClick={() => { setResumeTarget(upload); setSelectedResumeId(upload.uploadId); setFile(null); setErrorMsg(''); }} className="text-emerald-700 dark:text-emerald-400 underline">Resume</button><button disabled={Boolean(pendingBusy)} onClick={() => discardPending(upload)} className="text-red-600 dark:text-red-400">Discard upload</button></div></li>)}</ul></details>}
 
           {isIdle && tab === 'file' && !file && (
@@ -363,16 +363,15 @@ export default function ImportGameModal({ open, onClose, onImported, resumeUploa
           {(phase === 'uploading' || phase === 'paused') && <div className="space-y-4">
             <div className="p-4 bg-gray-50 dark:bg-gray-800/50 rounded-xl border border-gray-200 dark:border-gray-700 space-y-2">
               <p className="font-medium text-gray-900 dark:text-white break-all">{file?.name || resumeTarget?.name}</p>
-              <p role="status" className="text-sm text-gray-700 dark:text-gray-300">{phase === 'paused' ? 'Upload paused' : ({ checking: 'Checking archive locally…', connecting: 'Connecting to upload service…', 'preparing-chunk': 'Preparing next chunk…', uploading: 'Uploading archive…', 'confirming-chunk': 'Waiting for server acknowledgement…', retrying: 'Connection interrupted — retrying…', confirming: 'Confirming completed upload…', accepted: 'Upload accepted' }[uploadMetrics?.stage] || 'Preparing upload…')}</p>
-              {uploadMetrics?.stage === 'checking' ? <p className="text-xs text-gray-500 dark:text-gray-400">{formatFileSize(uploadMetrics.checkedBytes || 0)} of {formatFileSize(file?.size || 0)} checked. This runs locally in a worker before transfer.</p> : <>
+              <p role="status" className="text-sm text-gray-700 dark:text-gray-300">{phase === 'paused' ? 'Upload paused' : ({ connecting: 'Connecting to upload service…', uploading: 'Uploading archive…', retrying: 'Connection interrupted — retrying…', confirming: 'Confirming completed upload…', accepted: 'Upload accepted' }[uploadMetrics?.stage] || 'Preparing upload…')}</p>
+
                 <p className="text-xs text-gray-500 dark:text-gray-400">Sent: {formatFileSize(uploadMetrics?.sentBytes || 0)} of {formatFileSize(file?.size || resumeTarget?.size || 0)}</p>
                 <p className="text-xs text-gray-500 dark:text-gray-400">Server confirmed: {formatFileSize(uploadMetrics?.confirmedBytes || 0)} · {formatFileSize(uploadMetrics?.bytesPerSecond || 0)}/s · Elapsed {Math.floor((uploadMetrics?.elapsedMs || 0) / 1000)}s</p>
                 {uploadMetrics?.lastNetworkProgressAt && phase === 'uploading' && <p className="text-xs text-gray-500 dark:text-gray-400">Last transfer progress {Math.max(0, Math.floor((clock - uploadMetrics.lastNetworkProgressAt) / 1000))}s ago</p>}
-              </>}
               {uploadMetrics?.stage === 'retrying' && <p className="text-xs text-amber-700 dark:text-amber-300">{uploadMetrics.message}</p>}
               {uploadId && <p className="text-xs text-gray-500 dark:text-gray-400 break-all">Upload ID: {uploadId}</p>}
             </div>
-            <ProgressBar progress={progress} color="blue" label={uploadMetrics?.stage === 'checking' ? 'Checking archive' : 'Upload progress'} />
+            <ProgressBar progress={progress} color="blue" label="Upload progress" />
             <p className="text-xs text-gray-500 dark:text-gray-400">Keep this tab open while uploading. Pause or close to retain confirmed bytes, then reselect this archive to resume. Verification and extraction continue on the server after acceptance.</p>
             {errorMsg && <p role="alert" className="text-sm text-red-600 dark:text-red-400">{errorMsg}</p>}
           </div>}
