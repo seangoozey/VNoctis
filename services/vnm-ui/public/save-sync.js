@@ -24,7 +24,7 @@
   let logicalCatalog = null, referenceUploads = false, catalogWrites = Promise.resolve();
   let catalogOrder = 0, newestCatalogOrder = 0;
   let scheduledCatalogKey = null;
-  let lazyRuntime = null, installing = false;
+  let lazyRuntime = null, installing = false, menuImportPending = false;
   let preparedSaves = null;
   const residentHashes = new Map();
   let lastUploadedContents = null, lastStatus, noticeSequence = 0;
@@ -941,7 +941,7 @@
     return current;
   }
   async function upload() {
-    if (!initialized || blocked || busy || !meta.dirty) return;
+    if (!initialized || blocked || busy || menuImportPending || !meta.dirty) return;
     busy = true;
     clearTimeout(preparationRetry);
     let retryPreparation = false;
@@ -1003,11 +1003,117 @@
       } else if (urgentUploadPending) { urgentUploadPending = false; upload(); }
     }
   }
+  // Ren'Py's ZIP export enumerates only resident files, whereas our catalog may
+  // still contain remote-only slots. Keep its ZIP format, but hydrate first.
+  function installSaveMenu() {
+    const menu = document.getElementById?.('ContextMenu');
+    if (menu && !document.getElementById('vnm-save-export-note')) {
+      const note = document.createElement('p');
+      note.id = 'vnm-save-export-note';
+      note.textContent = 'Exports contain web-runtime saves. Desktop compatibility depends on the game and Ren’Py version; no conversion is performed.';
+      note.style.cssText = 'margin:8px 14px;font:12px/1.5 sans-serif;color:var(--text-dim,#aaa);white-space:normal';
+      menu.querySelector('a[href*="onSavegamesExport"]')?.after(note);
+    }
+    if (typeof window.onSavegamesExport !== 'function' || typeof window.onSavegamesImport !== 'function') return;
+    let operation = false;
+    const ready = () => {
+      if (!initialized || blocked) throw new Error('Save sync is not ready or is paused. Reopen the game before importing or exporting.');
+      if (localStorage.getItem('vnm-token') !== token) throw new Error('Account changed. Reopen the game before importing or exporting.');
+    };
+    window.onSavegamesExport = async () => {
+      if (operation) return;
+      operation = true;
+      try {
+        ready(); status('Preparing save export…', false, true);
+        const directory = await window.renpy_get('config.savedir');
+        if (typeof directory !== 'string' || !directory.startsWith(root + '/')) throw new Error('The game save directory is unavailable.');
+        const prefix = directory.slice(root.length + 1).replace(/\/+$/, '') + '/';
+        const generation = mutationVersion;
+        const rows = logicalCatalog?.export().files.filter(file => file.path.startsWith(prefix)) || [];
+        for (const row of rows) await hydrate(`${root}/${row.path}`, { foreground: true });
+        ready();
+        if (generation !== mutationVersion || rows.some(row => catalogRow(row.path)?.hash !== row.hash)) throw new Error('Saves changed while preparing the export. Try again.');
+        if (await window.renpy_exec('result = renpy.savelocation.zip_saves()')) {
+          window.FSDownload('savegames.zip', 'application/zip');
+          status('Save export downloaded — desktop compatibility is not guaranteed.', false, true);
+        }
+      } catch (error) {
+        reportFailure('export', error); status(`Save export failed: ${error.message}`, false, true);
+      } finally { operation = false; }
+    };
+    window.onSavegamesImport = async input => {
+      const file = input.files?.[0];
+      input.value = '';
+      if (!file || operation) return;
+      operation = true; menuImportPending = true;
+      try {
+        ready();
+        if (!file.size || file.size > maxSnapshotBytes) throw new Error('Select a save ZIP no larger than 128 MiB.');
+        status('Importing browser saves…', false, true);
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        ready(); fs.writeFile('savegames.zip', bytes);
+        // Match native flat/current-game ZIP layouts, validating every accepted
+        // member before writing through the engine filesystem hooks.
+        // VNoctis backup packages use the reviewed launcher import instead.
+        await window.renpy_exec(`def _vnm_import_menu_zip():
+    import zipfile as _vnm_zipfile
+    with _vnm_zipfile.ZipFile('savegames.zip') as _vnm_zip:
+        _vnm_entries = _vnm_zip.infolist()
+        if len(_vnm_entries) > 2048 or sum(i.file_size for i in _vnm_entries) > 134217728:
+            raise Exception('Save ZIP exceeds the import limits.')
+        _vnm_names = set()
+        _vnm_members = []
+        for _vnm_info in _vnm_entries:
+            _vnm_path = _vnm_info.filename
+            if _vnm_info.is_dir():
+                continue
+            if any(ord(c) < 32 for c in _vnm_path) or '\\\\' in _vnm_path or ':' in _vnm_path or any(p in ('', '.', '..') for p in _vnm_path.split('/')):
+                raise Exception('Unsafe path in save ZIP.')
+            if '/' in _vnm_path:
+                _vnm_prefix, _, _vnm_path = _vnm_path.partition('/')
+                if not renpy.config.save_directory or _vnm_prefix != renpy.config.save_directory:
+                    continue
+            if '/' in _vnm_path or not (_vnm_path.endswith('.save') or _vnm_path == 'persistent'):
+                raise Exception('Use Save History to import VNoctis backup ZIPs; this menu accepts RenPy save ZIPs.')
+            if _vnm_path in _vnm_names:
+                raise Exception('Duplicate save filename in ZIP.')
+            _vnm_names.add(_vnm_path)
+            _vnm_members.append((_vnm_path, _vnm_info))
+        if not _vnm_names:
+            raise Exception('No saves for this game were found in the ZIP.')
+        _vnm_contents = [(name, _vnm_zip.read(info)) for name, info in _vnm_members]
+    # All paths, sizes and CRCs have been checked before the first destination write.
+    import os as _vnm_os
+    _vnm_os.makedirs(renpy.config.savedir, exist_ok=True)
+    for _vnm_name, _vnm_data in _vnm_contents:
+        with open(_vnm_os.path.join(renpy.config.savedir, _vnm_name), 'wb') as _vnm_out:
+            _vnm_out.write(_vnm_data)
+    del _vnm_contents, _vnm_members
+try:
+    _vnm_import_menu_zip()
+finally:
+    del _vnm_import_menu_zip
+result = True`);
+        // Native writes go through the same close/rename hooks as gameplay.
+        // Flush the whole import before allowing an upload to be prepared.
+        await new Promise((resolve, reject) => fs.syncfs(false, error => error ? reject(error) : resolve()));
+        await window.renpy_exec('renpy.loadsave.location.scan()');
+        status('Saves imported — available in Load; server sync pending.', false, true);
+      } catch (error) {
+        reportFailure('import', error); status(`Save import failed: ${error.message}`, false, true);
+      } finally {
+        menuImportPending = false; operation = false;
+        try { fs.unlink('savegames.zip'); } catch { /* No temporary ZIP yet. */ }
+        upload();
+      }
+    };
+  }
   window.Module = window.Module || {};
   const oldPreInit = Module.preInit;
   Module.preInit = [...(Array.isArray(oldPreInit) ? oldPreInit : oldPreInit ? [oldPreInit] : []), () => {
     fs = Module.FS || window.FS;
     if (!fs || !window.IDBFS?.getDB) { status('Unsupported runtime — browser saves only'); return; }
+    installSaveMenu();
     originalGetDB = IDBFS.getDB.bind(IDBFS);
     IDBFS.getDB = (name, callback) => originalGetDB(name === root ? namespace : name, callback);
     const engineSync = fs.syncfs.bind(fs);
