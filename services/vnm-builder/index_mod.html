@@ -447,6 +447,8 @@
         const t = textDiv.textContent.toLowerCase();
         if      (t.includes('game data')) labelEl.textContent = 'Game Data';
         else if (t.includes('engine'))    labelEl.textContent = 'Engine';
+        else if (t.includes('preparing interface')) labelEl.textContent = 'Interface';
+        else if (t.includes('loading script')) labelEl.textContent = 'Scripts';
         else if (t.includes('cache'))     labelEl.textContent = 'Cache';
         else if (t.length > 0)            labelEl.textContent = 'Loading';
         if (t.includes('error') || t.includes('could not') || t.includes('aborted')) {
