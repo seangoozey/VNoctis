@@ -281,4 +281,5 @@ model ImportUpload {
   updatedAt DateTime @updatedAt
   job WorkJob @relation(fields: [id], references: [id], onDelete: Cascade)
   @@index([ownerId, expiresAt])
+  pendingChunks String @default("[]")
 }

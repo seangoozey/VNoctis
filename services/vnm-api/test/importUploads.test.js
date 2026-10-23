@@ -64,3 +64,39 @@ test('assembled archive verification rejects corruption before any extraction',a
  const job=await prisma.workJob.findUnique({where:{id:upload.uploadId}}),input=JSON.parse(job.input);input.expectedHash='0'.repeat(64);const stages=[];
  await assert.rejects(handlers.get('import')(job,input,{directory:runner.directory(job.id),signal:new AbortController().signal,log:async()=>{},progress:async data=>stages.push(data.stage)}),/checksum mismatch/);assert.ok(stages.includes('verifying'));assert.ok(!stages.includes('inspecting'));
 });
+
+
+test('pipelined chunks survive out-of-order receipt, restart and lost acknowledgements without a full-file checksum',async t=>{
+ const {prisma,app,runner,base,send,chunk}=await fixture(t);const id=randomUUID(),bytes=Buffer.from('0123456789');
+ let response=await send('POST',base,{uploadId:id,name:'pipeline.zip',size:bytes.length,protocol:2});assert.equal(response.statusCode,201,response.body);
+ const upload={uploadId:id};assert.equal(response.json().protocol,2);assert.equal(response.json().maxInflight,3);
+ response=await chunk(upload,4,bytes.subarray(4,8));assert.equal(response.statusCode,200,response.body);assert.equal(response.json().offset,0);assert.equal(response.json().pendingChunks.length,1);
+ // Offset is the contiguous durable prefix, never the sparse file's size.
+ assert.equal((await send('POST',`${base}/${id}/complete`)).statusCode,409);
+ const restarted=createImportUploads(app),state=await restarted.get(id,'alice');assert.equal(state.pendingChunks[0].offset,4);
+ response=await chunk(upload,4,bytes.subarray(4,8));assert.equal(response.statusCode,200);assert.equal(response.json().pendingChunks.length,1);
+ assert.equal((await chunk(upload,4,Buffer.from('xxxx'))).statusCode,409);assert.equal((await chunk(upload,3,Buffer.from('xxx'))).statusCode,409);
+ response=await chunk(upload,0,bytes.subarray(0,4));assert.equal(response.json().offset,8);assert.equal(response.json().pendingChunks.length,0);
+ await chunk(upload,8,bytes.subarray(8));assert.deepEqual(await readFile(join(runner.directory(id),'archive.zip')),bytes);
+ response=await send('POST',`${base}/${id}/complete`);assert.equal(response.statusCode,202);const job=await prisma.workJob.findUnique({where:{id}});assert.equal(JSON.parse(job.input).expectedHash,undefined);assert.equal(job.stage,'inspecting');
+ assert.equal((await send('POST',`${base}/${id}/complete`)).statusCode,202);
+});
+
+test('pipeline rejects corrupted chunks and skips unconfirmed crash bytes until they are resent',async t=>{
+ const {app,runner,base,send,chunk}=await fixture(t);const id=randomUUID(),bytes=Buffer.from('abcdefgh');
+ await send('POST',base,{uploadId:id,name:'game.zip',size:8,protocol:2});const upload={uploadId:id};
+ assert.equal((await chunk(upload,0,bytes.subarray(0,4),{'x-chunk-sha256':'0'.repeat(64)})).statusCode,422);
+ await appendFile(join(runner.directory(id),'archive.zip'),'uncommitted tail from a crash');
+ let response=await chunk(upload,4,bytes.subarray(4));assert.equal(response.json().offset,0);
+ response=await chunk(upload,0,bytes.subarray(0,4));assert.equal(response.json().offset,8);
+ // Trim any uncommitted tail before handing the completed archive to extraction.
+ await send('POST',`${base}/${id}/complete`);assert.deepEqual(await readFile(join(runner.directory(id),'archive.zip')),bytes);
+});
+
+
+test('discarding a pipelined upload removes sparse data and permits a new upload with the same filename',async t=>{
+ const {runner,base,send,chunk}=await fixture(t),id=randomUUID();
+ await send('POST',base,{uploadId:id,name:'same.zip',size:10,protocol:2});await chunk({uploadId:id},5,Buffer.from('56789'));
+ assert.equal((await send('DELETE',`${base}/${id}`)).statusCode,200);await assert.rejects(access(runner.directory(id)));
+ const next=randomUUID(),response=await send('POST',base,{uploadId:next,name:'same.zip',size:10,protocol:2});assert.equal(response.statusCode,201,response.body);assert.equal(response.json().offset,0);assert.deepEqual(response.json().pendingChunks,[]);
+});

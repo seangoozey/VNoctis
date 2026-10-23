@@ -12,10 +12,10 @@ function fixture(t,options={}){
  const identity=()=>({userId:user,token:'do-not-log-this-secret'});
  const request=async(path,opts={})=>{
   calls.push({path,method:opts.method||'GET',bytes:opts.body instanceof Blob?opts.body.size:0});
-  if(path.endsWith('/limits')){if(options.oldServer)throw fail(404);return {maxBytes:options.maxBytes||1e9,chunkSize:options.chunkSize||3};}
+  if(path.endsWith('/limits')){if(options.oldServer)throw fail(404);return {protocol:2,maxBytes:options.maxBytes||1e9,chunkSize:options.chunkSize||3};}
   const id=path.split('/').at(-1)==='complete'?path.split('/').at(-2):path.split('/').at(-1).split('?')[0];
   if(path.endsWith('/import-uploads')&&(opts.method||'GET')==='GET')return [...records.values()].filter(r=>r.status==='uploading').map(r=>({...r}));
-  if(path.endsWith('/import-uploads')&&opts.method==='POST'){const body=JSON.parse(opts.body);const state={...body,jobId:body.uploadId,offset:0,status:'uploading',chunkSize:options.chunkSize||3,expiresAt:new Date(Date.now()+86400000).toISOString()};records.set(body.uploadId,state);return {...state};}
+  if(path.endsWith('/import-uploads')&&opts.method==='POST'){const body=JSON.parse(opts.body);const state={...body,jobId:body.uploadId,offset:0,status:'uploading',pendingChunks:[],chunkSize:options.chunkSize||3,maxInflight:options.maxInflight||1,expiresAt:new Date(Date.now()+86400000).toISOString()};records.set(body.uploadId,state);return {...state};}
   if(path.includes('/chunk?')){
    const uploadId=path.split('/').at(-2),state=records.get(uploadId),offset=Number(new URL(path,'http://test').searchParams.get('offset'));
    if(opts.body.size>(options.proxyCap||Infinity))throw fail(413);
@@ -25,7 +25,7 @@ function fixture(t,options={}){
    if(options.changeUser)user='bob';
    if(options.abort){options.abort.abort();throw options.abort.signal.reason;}
    if(options.loseAck&&!failureCount++){throw fail(0);}
-   return {...state};
+   const reply={...state}; await options.onChunk?.({offset,state,opts}); return reply;
   }
   const state=records.get(id);if(!state)throw fail(404);
   if(path.endsWith('/complete')){if(state.status==='uploading'){state.status='queued';queued++;}if(options.loseCompletion&&!failureCount++){throw fail(503);}return {...state};}
@@ -36,7 +36,7 @@ function fixture(t,options={}){
  return {run,records,cache,calls,events,diagnostics,options,get queued(){return queued},get hashCount(){return hashCount},get failures(){return failureCount}};
 }
 test('chunks and acknowledgements expose exact progress without a whole-file request',async t=>{
- const f=fixture(t),archive=file('abcdefghij');const result=await f.run(archive);assert.equal(result.status,'queued');assert.equal(f.queued,1);assert.deepEqual(f.calls.filter(c=>c.path.includes('/chunk?')).map(c=>c.bytes),[3,3,3,1]);assert.equal(f.cache.size,0);assert.ok(f.events.some(e=>e.stage==='confirming-chunk'&&e.sentBytes>e.confirmedBytes));assert.equal(f.events.at(-1).confirmedBytes,10);
+ const f=fixture(t),archive=file('abcdefghij');const result=await f.run(archive);assert.equal(result.status,'queued');assert.equal(f.queued,1);assert.deepEqual(f.calls.filter(c=>c.path.includes('/chunk?')).map(c=>c.bytes),[3,3,3,1]);assert.equal(f.cache.size,0);assert.ok(f.events.some(e=>e.sentBytes>e.confirmedBytes));assert.equal(f.events.at(-1).confirmedBytes,10);
 });
 test('lost chunk acknowledgement queries durable offset without resending accepted bytes',async t=>{
  const f=fixture(t,{loseAck:true});await f.run(file('abcdef'));assert.equal(f.queued,1);assert.equal(f.calls.filter(c=>c.path.includes('/chunk?offset=0')).length,1);assert.ok(f.diagnostics.some(e=>e.stage==='chunk'));assert.ok(!JSON.stringify(f.diagnostics).includes('do-not-log-this-secret'));
@@ -71,4 +71,20 @@ test('idle chunk watchdog reports a stall and aborts the stalled request',async 
  globalThis.XMLHttpRequest=class {constructor(){this.upload={};}open(){}setRequestHeader(){}send(){}abort(){aborted=true;this.onabort?.();}};
  t.after(()=>{if(previous===undefined)delete globalThis.XMLHttpRequest;else globalThis.XMLHttpRequest=previous;});
  await assert.rejects(importRequest('/test',{method:'PUT',body:new Blob(['bytes']),idleMs:1}),error=>error.code==='UPLOAD_STALLED');assert.equal(aborted,true);
+});
+
+
+test('later chunks transfer before an earlier acknowledgement and hashing never scans the archive',async t=>{
+ let release;const gate=new Promise(resolve=>{release=resolve;});let active=0,max=0;
+ const f=fixture(t,{maxInflight:3,onChunk:async({offset})=>{active++;max=Math.max(max,active);if(offset===0)await gate;else release();active--;}});
+ const archive=file('abcdefghijkl');archive.arrayBuffer=()=>{throw new Error('Full-file read forbidden');};
+ const hashed=[];const hasherFactory=()=>({hash:async blob=>{hashed.push(blob.size);return digest(Buffer.from(await blob.arrayBuffer()));},close(){}});
+ await f.run(archive,{hasherFactory});assert.ok(max>=2,'network requests overlap server acknowledgement waits');assert.ok(hashed.every(size=>size<=3));assert.ok(!f.events.some(e=>e.stage==='checking'));assert.equal(f.queued,1);assert.equal(f.events.at(-1).confirmedBytes,archive.size);
+});
+
+test('same-name same-size archive resumes without rescanning confirmed bytes',async t=>{
+ const controller=new AbortController(),f=fixture(t,{abort:controller});await assert.rejects(f.run(file('abcdef'),{signal:controller.signal}));delete f.options.abort;
+ // Content identity is intentionally user-trusted; no prefix fingerprint scan.
+ const selected=file('abcXYZ');selected.arrayBuffer=()=>{throw new Error('Full-file read forbidden');};
+ await f.run(selected);assert.equal(f.records.size,1);assert.equal(f.calls.filter(c=>c.path.includes('/chunk?offset=0')).length,1);assert.equal(f.queued,1);
 });

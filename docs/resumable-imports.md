@@ -1,80 +1,81 @@
 # Resumable game imports
 
-The browser importer transfers `.zip`, `.tar.bz2` and `.rar` archives in sequential
-chunks of at most 16 MiB. It creates a durable Jobs entry before transferring file
-data. URL imports remain server-side downloads; the old multipart endpoint remains
-available to older clients.
+The browser imports `.zip`, `.tar.bz2` and `.rar` archives through a bounded
+pipeline. It creates a durable Jobs entry before transferring data, then prepares
+and sends chunks immediately. There is no whole-archive scan before upload and
+no re-scan of confirmed bytes when resuming.
 
-## Upload and recovery
+## Transfer and verification
 
-The browser first reads the archive in a worker to compute its SHA-256 identity.
-This local check can take time for a large archive; its progress is shown separately
-from network transfer. Each chunk also has a checksum. Only bytes written, synced
-to disk and recorded in the database count as **server confirmed**. Bytes merely
-sent by the browser are shown separately.
+Up to three requests are in flight, with chunks of at most 16 MiB. A worker
+prepares the next chunk checksum while earlier requests transfer or await durable
+confirmation. HTTPS uses native SHA-256 where available; plain HTTP uses the
+worker fallback. Each received chunk is verified before writing, synced to disk,
+and recorded in the database before it counts as confirmed.
 
-After an interrupted request, the client checks the server's confirmed offset
-before retrying. A lost acknowledgement does not require resending confirmed
-bytes. Transient failures use bounded backoff; HTTP 413 reduces the chunk size,
-down to 256 KiB. A request with no upload progress or acknowledgement for 90
-seconds is aborted and enters recovery rather than hanging indefinitely.
+Chunks may arrive out of order. The server retains verified ranges beyond the
+contiguous prefix, bounded to a 48 MiB window and 256 pending ranges. A missing
+range cannot be mistaken for received data merely because a sparse file has the
+expected size. Retried chunks are checked against confirmed bytes or their
+pending receipt, so a lost acknowledgement need not resend accepted data.
 
-Closing the importer pauses file transfer. Reopen **Import Game**, select an
-unfinished upload, and reselect the same archive. **Jobs → Resume upload** opens
-the same flow. Content and size must match; the file is checked again after a
-reload. The browser cannot silently reopen a local file after a tab closes.
-Only the administrator who created the upload can resume it. Changing accounts
-stops an active transfer.
+The client retains at most three in-flight chunks plus one being prepared;
+server request bodies are bounded to 16 MiB each. Transient failures use bounded
+backoff. HTTP 413 reduces chunks down to 256 KiB. A request with no upload
+progress or acknowledgement for 90 seconds enters recovery. The pipeline reduces
+idle gaps but cannot guarantee saturation when client CPU, disk, proxy or network
+capacity is the bottleneck.
 
-Incomplete uploads expire 24 hours after their last confirmed chunk. A periodic
-cleanup marks expired jobs failed and removes staged bytes. **Discard upload**
-removes them immediately; administrators can also cancel from Jobs. Expired or
-cancelled incomplete uploads need a new upload, rather than a processing retry.
+## Resume and cleanup
 
-If all bytes are confirmed, **Jobs → Finish upload** submits them without
-reselecting the file. Acceptance is idempotent. Whole-archive checksum verification
-runs in the background before inspection or extraction. Extraction and library
-registration then use the existing background importer and archive validation.
-Once accepted, the browser can close while processing continues.
+Close or pause the importer, reopen **Import Game** (or **Jobs → Resume upload**),
+and reselect the original archive. Uploads match by administrator, archive name
+and size. There is deliberately no full content-identity check: selecting a
+different same-name/same-size file can produce a mixed archive. Chunk hashes
+verify transmitted bytes, not the identity of a reselected file. The user is
+responsible for selecting the original archive.
 
-## Diagnostics
+**Discard upload** or Jobs **Cancel** removes unfinished staged data. Start a new
+upload afterward. Confirmed progress survives browser reloads and API restarts
+for 24 hours after the last confirmed chunk; expiry marks the job failed and
+removes staged bytes. Cancelled/expired partial uploads need a new upload.
 
-The importer shows bytes sent, bytes confirmed, transfer rate, elapsed time,
-last network progress, and upload ID. **Download diagnostics** exports these
-details and bounded recent failures without tokens or authorization headers.
-Browser warnings use `[VNoctis import upload]` with expanded JSON text.
-API logs correlate chunk acknowledgements and errors by upload ID and request ID;
-the retained job log records confirmed progress and subsequent processing.
+When every byte is durably accounted for, **Jobs → Finish upload** can queue the
+archive without selecting a file again. Completion is idempotent. New uploads
+need no second whole-file checksum pass: verification already happened per chunk.
+Archive inspection, extractor integrity checks and library registration run in
+background jobs. Archive validation failure appears in Jobs; removing that failed
+job removes its staging files, allowing a fresh upload.
 
-These details help distinguish a browser/network stall, proxy rejection, server
-write failure and archive-processing failure. They do not establish the cause of
-any earlier office-network failures; those require evidence from that deployment.
+URL imports remain server-side downloads. Legacy multipart uploads remain
+supported. Older resumable uploads retain their original whole-file checksum and
+sequential protocol, and can finish after the update.
 
-## Storage and deployment
+## Diagnostics and deployment
 
-Deploy the API and UI together. API startup applies the new `ImportUpload` SQLite
-migration. No builder image change or game rebuild is required. Keep `/data`
-persistent: staged chunks live in `/data/import-jobs/<upload-id>/`, with the offset
-ledger in the database. Existing Jobs logs and processing cleanup still apply.
+The UI shows one upload progress pass with sent and server-confirmed bytes, rate,
+elapsed time and upload ID. Token-free diagnostic downloads and retained job/API
+logs correlate interruptions and confirmed ranges. Transfer confirmation is
+separate from background archive processing.
 
-The total archive limit remains `MAX_IMPORT_SIZE_MB` (default 24576 MiB). Up to ten
-unfinished uploads are allowed per administrator. Chunk buffers are bounded by
-16 MiB per concurrent request; the whole archive is not buffered in browser or API
-memory. The server still needs space for the staged archive and extracted game.
+Deploy API and UI together. API startup applies the `pendingChunks` SQLite
+migration. Keep `/data` persistent: the archive lives in
+`/data/import-jobs/<upload-id>/` and the durable range ledger in the database.
+No builder change or game rebuild is required for this upload update.
 
-External proxies must permit the chunk requests and suitable idle timeouts.
-Smaller requests reduce the cost of connection failures, but cannot repair a
-network or proxy that prevents all uploads. Larger body limits remain necessary
-for legacy multipart imports and save-backup ZIP imports if those are used.
+The total archive limit remains `MAX_IMPORT_SIZE_MB` (default 24576 MiB), with up
+to ten unfinished uploads per administrator. External proxies must permit chunk
+requests and suitable idle timeouts. Larger request limits still apply to legacy
+multipart uploads and save-backup ZIP imports. Disk space is required for the
+staged archive and extracted game.
 
 ## Validation
 
-API coverage exercises ownership, admin access, idempotent creation/completion,
-checksums, offsets, duplicate chunks, concurrent retries, restart recovery,
-uncommitted disk tails, cancellation and expiry. Client coverage exercises lost
-acknowledgements, pause/resume, bounded retries, proxy limits, account changes,
-wrong-file selection and idle detection.
-
-Production-image browser checks additionally cover real worker hashing and
-extraction through Nginx, discarding a successful chunk acknowledgement, resuming
-after an API restart and page reload, and reducing chunks after proxy rejection.
+API coverage exercises ownership, checksums, durable offsets, out-of-order ranges,
+duplicate/overlapping chunks, restart/crash-tail recovery, cancellation, expiry,
+and compatibility with the original protocol. Client coverage verifies pipeline
+overlap before earlier acknowledgements, no whole-file scan, trusted name/size
+resume, lost acknowledgements, bounded retries, proxy limits and account changes.
+Production-image browser checks exercise actual worker hashing, Nginx, extraction,
+API restart/resume and proxy rejection. Office-network throughput still needs
+validation on that deployment.

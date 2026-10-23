@@ -63,6 +63,9 @@ function browser(server, databases, { user = 'A', game = 'X', metadata = new Map
     atob: s => Buffer.from(s, 'base64').toString('binary'), btoa: s => { encodings++; return Buffer.from(s, 'binary').toString('base64'); },
     localStorage: { getItem: key => metadata.get(key) ?? null, setItem: (key, value) => metadata.set(key, value) },
     parent: { postMessage: data => { statuses.push(data.message); events.push(data); } },
+    onSavegamesImport() {}, onSavegamesExport() {},
+    renpy_exec: async code => server.menuExec?.(code, fs),
+    FSDownload: () => { server.menuDownloads = (server.menuDownloads || 0) + 1; },
     Module: { FS: fs },
     ...(savedir === undefined ? {} : { renpy_get: async expression => { assert.equal(expression, 'config.savedir'); return savedir; } }),
     IDBFS: { getDB: (name, callback) => {
@@ -221,6 +224,8 @@ function browser(server, databases, { user = 'A', game = 'X', metadata = new Map
     fs, statuses, events, metadata, namespace, backups, prompts, warnings, requestTimeouts,
     flushMetrics: () => ({ active: activeFlushes, max: maxFlushes, calls: nativeFlushCalls }),
     runtime: () => context.vnmSaves,
+    menuExport: () => context.onSavegamesExport(),
+    menuImport: file => context.onSavegamesImport({ files: [file], value: 'selected.zip' }),
     async loadSlot(path) { context.vnmSaves.begin(`${root}/${path}`); while (context.vnmSaves.transfer.pending) await settle(); return context.vnmSaves.transfer; },
     encodedCount: () => encodings,
     offline: value => { offline = value; },
@@ -1010,4 +1015,60 @@ test('an evicted clean browser filesystem restores the server copy instead of pu
   const reload = browser(server, databases, { metadata }); await reload.start();
   assert.equal(Buffer.from(reload.fs.readFile(`${root}/game/1.save`)).toString(), 'server progress');
   assert.equal(server.get('A:X').revision, 1);
+});
+
+
+test('in-game export hydrates remote-only slots before invoking native ZIP generation', async () => {
+  const make = (n) => ({ path: `game/${n}-LT1.save`, mtime: n, data: Buffer.from(`slot ${n}`).toString('base64') });
+  const server = new Map([['A:X', { revision: 1, snapshot: { version: 1, files: [make(1), make(2), make(3)] } }]]);
+  server.fileDownloads = true; server.referenceUploads = true; server.pausePrefetch = true;
+  server.directories = new Map([['A:X', 'game']]);
+  let exported = false;
+  server.menuExec = (code, fs) => {
+    assert.equal(code, 'result = renpy.savelocation.zip_saves()');
+    for (let n = 1; n <= 3; n++) assert.equal(Buffer.from(fs.readFile(`${root}/game/${n}-LT1.save`)).toString(), `slot ${n}`);
+    exported = true; return true;
+  };
+  const page = browser(server, new Map(), { adapter: true, savedir: `${root}/game` }); await page.start();
+  assert.equal(server.binaryRequests.length, 1); await page.menuExport();
+  assert.ok(exported); assert.equal(server.menuDownloads, 1);
+  await page.retry(); assert.equal(server.uploads.length, 0, 'export hydration must not create save progress');
+  assert.match(page.statuses.at(-1), /desktop compatibility is not guaranteed/);
+});
+
+test('failed hydration never downloads an incomplete in-game save export', async () => {
+  const server = new Map([['A:X', { revision: 1, snapshot: { version: 1, files: [1, 2].map(n => ({ path: `game/${n}-LT1.save`, mtime: n, data: Buffer.from(`slot ${n}`).toString('base64') })) } }]]);
+  server.fileDownloads = true; server.referenceUploads = true; server.pausePrefetch = true; server.directories = new Map([['A:X', 'game']]);
+  const page = browser(server, new Map(), { adapter: true, savedir: `${root}/game` }); await page.start(); page.offline(true);
+  await page.menuExport(); assert.equal(server.menuDownloads, undefined); assert.match(page.statuses.at(-1), /Save export failed/);
+});
+
+test('in-game import flushes and syncs completed writes while preserving uncached slots', async () => {
+  const server = new Map([['A:X', { revision: 1, snapshot: { version: 1, files: [1, 2].map(n => ({ path: `game/${n}-LT1.save`, mtime: n, data: Buffer.from(`slot ${n}`).toString('base64') })) } }]]);
+  server.fileDownloads = true; server.referenceUploads = true; server.pausePrefetch = true; server.directories = new Map([['A:X', 'game']]);
+  let release, entered; const gate = new Promise(resolve => { release = resolve; }), started = new Promise(resolve => { entered = resolve; });
+  server.menuExec = async (code, fs) => {
+    if (code.includes('import zipfile')) { fs.writeFile(`${root}/game/3-LT1.save`, Buffer.from('imported first')); entered(); await gate; fs.writeFile(`${root}/game/4-LT1.save`, Buffer.from('imported second')); }
+  };
+  const page = browser(server, new Map(), { adapter: true }); await page.start();
+  const importing = page.menuImport(new Blob(['test ZIP'])); await started; await page.flush(); await page.retry();
+  assert.equal(server.uploads.length, 0, 'no partial import is uploaded'); release(); await importing; await settle(); await page.retry();
+  const files = server.get('A:X').snapshot.files;
+  assert.equal(files.length, 4); assert.equal(files.find(file => file.path.endsWith('1-LT1.save')).data, Buffer.from('slot 1').toString('base64'));
+  assert.equal(files.find(file => file.path.endsWith('4-LT1.save')).data, Buffer.from('imported second').toString('base64'));
+});
+
+test('offline in-game import is retained and uploads after reconnecting', async () => {
+  const server = new Map();
+  server.menuExec = (code, fs) => { if (code.includes('import zipfile')) { fs.mkdirTree(`${root}/game`); fs.writeFile(`${root}/game/1.save`, Buffer.from('offline import')); } };
+  const page = browser(server, new Map()); await page.start(); page.offline(true);
+  await page.menuImport(new Blob(['test ZIP'])); await settle(); assert.equal(server.get('A:X'), undefined);
+  page.offline(false); await page.retry(); assert.equal(Buffer.from(server.get('A:X').snapshot.files[0].data, 'base64').toString(), 'offline import');
+});
+
+test('account changes and oversized ZIPs cannot invoke the in-game importer', async () => {
+  const server = new Map(); let executed = false; server.menuExec = () => { executed = true; };
+  const metadata = new Map(), page = browser(server, new Map(), { metadata }); await page.start();
+  await page.menuImport({ size: 134217729 }); assert.equal(executed, false); assert.match(page.statuses.at(-1), /128 MiB/);
+  metadata.set('vnm-token', 'different account'); await page.menuImport(new Blob(['zip'])); assert.equal(executed, false); assert.match(page.statuses.at(-1), /Account changed/);
 });

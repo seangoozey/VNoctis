@@ -716,6 +716,38 @@ space for the SQLite snapshot, ZIP and import staging. The supported limits are
 files, 10,000 game/account records and 50,000 historical versions. Exceeding a
 limit fails the task with an error rather than silently dropping data.
 
+## In-game Ren’Py save menu
+
+The web runtime's **Import Saves / Export Saves** controls remain available.
+Exports contain the original web-runtime files in Ren’Py's `savegames.zip` format;
+the menu explains that desktop compatibility depends on the game and engine
+versions, with no conversion. This ZIP is distinct from the versioned VNoctis
+backup packages downloaded from Save History.
+
+In an authenticated VNoctis player, Export Saves first hydrates any remote-only
+files for the active save directory. If a download fails or progress changes
+during preparation, it reports a save-sync notice instead of downloading an
+incomplete ZIP. Exporting does not create new save progress or history.
+
+Import Saves accepts flat Ren’Py ZIPs or files prefixed by the game's configured
+save-directory name. It validates paths, duplicate destination names, expanded
+size and CRCs before writing `.save` files and `persistent` into the active game
+and user's browser storage. Limits are 128 MiB compressed/expanded and 2,048
+archive entries. Flat ZIPs contain no reliable game identity, so users must
+select saves from the correct game. VNoctis backup packages use **Save History →
+Import backup ZIP** instead. Folder/file import in Save History remains available.
+
+Import writes share gameplay's filesystem hooks and serialized persistence queue.
+New uploads wait until the import is flushed; untouched remote slots stay in the
+logical catalog. Imported slots become available in Load after a native rescan.
+Offline imports remain local and retry synchronization when the connection
+returns. These operations use the existing save-sync status/toast channel.
+
+Updating the UI applies the bridge changes and menu note to existing authenticated
+builds after reopening the game; a game rebuild is not required. The builder
+HTML template also carries the note for future standalone builds. Public/R2 games
+without the authenticated bridge retain native import/export behavior.
+
 ## Separate upstream issue
 
 The existing migration history lacks the Game `publishStatus`, `publishedAt`, and

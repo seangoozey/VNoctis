@@ -368,9 +368,9 @@ You can import a Ren'Py game directly from the UI — either by uploading a loca
 1. Click the green **Import Game** button in the top navigation bar.
 2. Select the **Upload File** tab (default).
 3. **Drag and drop** an archive file (`.zip`, `.tar.bz2`, or `.rar`) onto the drop zone, or click to browse.
-4. Click **Upload & Import**. VNoctis checks the archive locally in a worker, creates a job, and uploads bounded chunks. Progress distinguishes bytes sent from bytes confirmed by the server.
+4. Click **Upload & Import**. VNoctis creates a job and uploads bounded chunks through a small pipeline, verifying chunks alongside transfer without a full-file pre-scan. Progress distinguishes bytes sent from bytes confirmed by the server.
 5. Keep the browser open to transfer the file, or **Pause & close**. To resume, reopen **Import Game** (or **Jobs → Resume upload**) and reselect the same archive. Confirmed chunks survive browser reloads and API restarts and are retained for 24 hours after the last confirmed progress.
-6. Once the complete upload is accepted, checksum verification, extraction and registration continue in the background. Follow the job from **Jobs**; the game appears in the library after processing completes.
+6. Once the complete verified upload is accepted, archive inspection, extraction and registration continue in the background. Follow the job from **Jobs**; the game appears in the library after processing completes.
 
 Unfinished uploads belong to the administrator who started them. Automatic retries
 are bounded, and failures include an upload ID and downloadable diagnostics without
@@ -714,10 +714,10 @@ are documented in the linked feature guides and route implementations.
 | `DELETE` | `/library/:gameId` | admin | Delete game source, output, covers/screenshots and library entry; saves and durable job/log records remain independently managed |
 | `POST` | `/library/import` | admin | Upload `.zip`, `.tar.bz2` or `.rar` (multipart field `file`); returns `202` and `{ jobId, status }` after staging the complete upload |
 | `GET` | `/library/import-uploads/limits` | admin | Total archive limit, chunk size and retention |
-| `GET`, `POST` | `/library/import-uploads` | admin | List own unfinished uploads; create an idempotent upload/job with `{ uploadId, name, size, checksum }` |
-| `GET`, `DELETE` | `/library/import-uploads/:id` | owning admin | Read confirmed offset or discard an unfinished upload |
+| `GET`, `POST` | `/library/import-uploads` | admin | List own unfinished uploads; create an idempotent upload/job with `{ uploadId, name, size, protocol: 2 }` |
+| `GET`, `DELETE` | `/library/import-uploads/:id` | owning admin | Read confirmed offset/pending verified ranges or discard an unfinished upload |
 | `PUT` | `/library/import-uploads/:id/chunk?offset=N` | owning admin | Raw chunk with `X-Chunk-SHA256`; acknowledge durable confirmed offset |
-| `POST` | `/library/import-uploads/:id/complete` | owning admin | Idempotently queue a complete archive for checksum verification and import |
+| `POST` | `/library/import-uploads/:id/complete` | owning admin | Idempotently queue a complete verified archive for import |
 | `POST` | `/library/import-url` | admin | Accept a URL-import job (JSON `{ "url": "..." }`); returns `202` and `{ jobId, status }`, progress via Jobs |
 
 ### Metadata & Builds
